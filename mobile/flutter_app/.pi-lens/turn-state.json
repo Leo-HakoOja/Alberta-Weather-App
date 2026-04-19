@@ -1,0 +1,207 @@
+{
+  "files": {
+    "lib/main.dart": {
+      "modifiedRanges": [
+        {
+          "start": 3,
+          "end": 3
+        },
+        {
+          "start": 5,
+          "end": 5
+        },
+        {
+          "start": 114,
+          "end": 114
+        },
+        {
+          "start": 122,
+          "end": 124
+        },
+        {
+          "start": 129,
+          "end": 147
+        },
+        {
+          "start": 178,
+          "end": 178
+        },
+        {
+          "start": 195,
+          "end": 195
+        },
+        {
+          "start": 248,
+          "end": 248
+        },
+        {
+          "start": 263,
+          "end": 306
+        },
+        {
+          "start": 316,
+          "end": 321
+        },
+        {
+          "start": 337,
+          "end": 341
+        },
+        {
+          "start": 344,
+          "end": 347
+        },
+        {
+          "start": 353,
+          "end": 353
+        },
+        {
+          "start": 356,
+          "end": 357
+        },
+        {
+          "start": 359,
+          "end": 361
+        },
+        {
+          "start": 363,
+          "end": 410
+        },
+        {
+          "start": 591,
+          "end": 592
+        },
+        {
+          "start": 596,
+          "end": 630
+        },
+        {
+          "start": 632,
+          "end": 647
+        },
+        {
+          "start": 652,
+          "end": 660
+        },
+        {
+          "start": 706,
+          "end": 706
+        },
+        {
+          "start": 721,
+          "end": 724
+        },
+        {
+          "start": 729,
+          "end": 733
+        },
+        {
+          "start": 745,
+          "end": 745
+        },
+        {
+          "start": 752,
+          "end": 754
+        },
+        {
+          "start": 756,
+          "end": 756
+        },
+        {
+          "start": 758,
+          "end": 759
+        },
+        {
+          "start": 761,
+          "end": 763
+        },
+        {
+          "start": 765,
+          "end": 765
+        },
+        {
+          "start": 771,
+          "end": 776
+        },
+        {
+          "start": 784,
+          "end": 787
+        },
+        {
+          "start": 789,
+          "end": 802
+        },
+        {
+          "start": 832,
+          "end": 832
+        },
+        {
+          "start": 837,
+          "end": 841
+        },
+        {
+          "start": 844,
+          "end": 844
+        },
+        {
+          "start": 850,
+          "end": 856
+        },
+        {
+          "start": 859,
+          "end": 859
+        },
+        {
+          "start": 863,
+          "end": 880
+        },
+        {
+          "start": 903,
+          "end": 903
+        },
+        {
+          "start": 916,
+          "end": 918
+        },
+        {
+          "start": 932,
+          "end": 935
+        },
+        {
+          "start": 937,
+          "end": 944
+        },
+        {
+          "start": 947,
+          "end": 947
+        },
+        {
+          "start": 953,
+          "end": 962
+        },
+        {
+          "start": 973,
+          "end": 999
+        }
+      ],
+      "importsChanged": true,
+      "lastEdit": "2026-04-19T14:29:40.143Z"
+    },
+    "test/widget_test.dart": {
+      "modifiedRanges": [
+        {
+          "start": 1,
+          "end": 1
+        },
+        {
+          "start": 9,
+          "end": 9
+        }
+      ],
+      "importsChanged": true,
+      "lastEdit": "2026-04-19T06:52:45.029Z"
+    }
+  },
+  "turnCycles": 0,
+  "maxCycles": 3,
+  "lastUpdated": "2026-04-19T14:29:40.143Z"
+}

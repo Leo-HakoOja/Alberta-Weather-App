@@ -1,0 +1,36 @@
+{
+  "location": {
+    "name": "Myrnam",
+    "province": "Alberta",
+    "country": "Canada",
+    "latitude": 53.66686,
+    "longitude": -111.23504,
+    "timezone": "America/Edmonton"
+  },
+  "units": {
+    "current": {
+      "temperature_2m": "°C",
+      "apparent_temperature": "°C",
+      "relative_humidity_2m": "%",
+      "wind_speed_10m": "km/h",
+      "wind_direction_10m": "°",
+      "uv_index": ""
+    },
+    "hourly": {
+      "temperature_2m": "°C",
+      "apparent_temperature": "°C",
+      "precipitation_probability": "%"
+    },
+    "daily": {
+      "temperature_2m_max": "°C",
+      "temperature_2m_min": "°C",
+      "uv_index_max": "",
+      "precipitation_probability_max": "%"
+    }
+  },
+  "current": {},
+  "hourly_next_24h": [],
+  "daily_7d": [],
+  "daily_14d_extended": [],
+  "source": "open-meteo.com"
+}
