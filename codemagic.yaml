@@ -33,6 +33,14 @@ workflows:
           cd "$FLUTTER_PROJECT_DIR/ios"
           pod install
 
+      - name: Set up keychain and fetch signing files
+        script: |
+          keychain initialize
+          app-store-connect fetch-signing-files ca.hakooja.albertaweather \
+            --type IOS_APP_STORE \
+            --create
+          keychain add-certificates
+
       - name: Configure code signing
         script: |
           cd "$FLUTTER_PROJECT_DIR/ios"
