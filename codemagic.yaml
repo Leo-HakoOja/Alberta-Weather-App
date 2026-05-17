@@ -12,11 +12,9 @@ workflows:
       cocoapods: default
       ios_signing:
         distribution_type: app_store
-        bundle_identifier: com.yourname.weatherapp
+        bundle_identifier: ca.hakooja.albertaweather
       vars:
         FLUTTER_PROJECT_DIR: mobile/flutter_app
-        BUNDLE_ID: com.yourname.weatherapp
-        APPLE_TEAM_ID: "YOUR_TEAM_ID"
         WEATHER_API_URL: https://api.example.com/v1/weather/myrnam
 
     scripts:
@@ -29,14 +27,6 @@ workflows:
         script: |
           cd "$FLUTTER_PROJECT_DIR"
           flutter pub get
-
-      - name: Set iOS bundle identifier + team for CI build
-        script: |
-          cd "$FLUTTER_PROJECT_DIR/ios"
-          sed -i '' "s/com.example.flutterApp/$BUNDLE_ID/g" Runner.xcodeproj/project.pbxproj
-          if ! grep -q "DEVELOPMENT_TEAM = $APPLE_TEAM_ID;" Runner.xcodeproj/project.pbxproj; then
-            sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER = $BUNDLE_ID;/PRODUCT_BUNDLE_IDENTIFIER = $BUNDLE_ID;\n\t\t\t\tDEVELOPMENT_TEAM = $APPLE_TEAM_ID;/g" Runner.xcodeproj/project.pbxproj
-          fi
 
       - name: Install CocoaPods
         script: |
@@ -71,7 +61,7 @@ workflows:
 
       email:
         recipients:
-          - you@example.com
+          - REDACTED
         notify:
           success: true
           failure: true
