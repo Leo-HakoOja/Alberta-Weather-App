@@ -33,8 +33,10 @@ workflows:
       - name: Set up keychain and fetch signing files
         script: |
           keychain initialize
+          openssl genrsa -out /tmp/ios_distribution_key.pem 2048
           app-store-connect fetch-signing-files ca.hakooja.albertaweather \
             --type IOS_APP_STORE \
+            --certificate-key=@file:/tmp/ios_distribution_key.pem \
             --create
           keychain add-certificates
 
