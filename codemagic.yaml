@@ -12,7 +12,7 @@ workflows:
       cocoapods: default
       vars:
         FLUTTER_PROJECT_DIR: mobile/flutter_app
-        WEATHER_API_URL: https://api.example.com/v1/weather/myrnam
+        WEATHER_API_URL: https://alberta-weather-api.fly.dev/v1/weather/myrnam
 
     scripts:
       - name: Validate Flutter project
