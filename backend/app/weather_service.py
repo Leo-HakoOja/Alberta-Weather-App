@@ -492,6 +492,17 @@ def normalize_forecast_response(data: dict, location: dict) -> dict:
     sunrise = sunrise_values[today_index] if today_index < len(sunrise_values) else None
     sunset = sunset_values[today_index] if today_index < len(sunset_values) else None
 
+    open_meteo_source = {
+        "source_id": "open-meteo",
+        "source_name": "Open-Meteo",
+        "attribution_url": "https://open-meteo.com/",
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "current": None,
+        "hourly_next_24h": [],
+        "daily_7d": [],
+        "error": None,
+    }
+
     return {
         "location": location,
         "units": {
@@ -520,23 +531,76 @@ def normalize_forecast_response(data: dict, location: dict) -> dict:
         "daily_7d": daily_items[:7],
         "daily_14d_extended": daily_items[7:14],
         "dayparts_14d": dayparts_14d,
-        "schema_version": "1.0.0",
+        "sources": [
+            {
+                **open_meteo_source,
+                "current": {
+                    "time": current_time,
+                    "temperature": current.get("temperature_2m"),
+                    "apparent_temperature": current.get("apparent_temperature"),
+                    "humidity": current.get("relative_humidity_2m"),
+                    "wind_speed": current.get("wind_speed_10m"),
+                    "wind_direction_degrees": current.get("wind_direction_10m"),
+                    "wind_direction_compass": wind_direction_to_compass(
+                        current.get("wind_direction_10m")
+                    ),
+                    "uv_index": current.get("uv_index"),
+                    "weather_code": current_code,
+                    "weather": weather_description(current_code),
+                    "sunrise": sunrise,
+                    "sunset": sunset,
+                    "is_daylight": _is_daylight_at(current_time, sunrise, sunset),
+                },
+                "hourly_next_24h": hourly_items,
+                "daily_7d": daily_items[:7],
+            },
+        ],
+        "schema_version": "1.1.0",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": "open-meteo.com",
     }
 
 
+def _append_eccc_source(response: dict, location: dict) -> dict:
+    """Add ECCC as a parallel source. Network failures degrade quietly."""
+    # Imported lazily to keep ECCC out of the hot path when the import chain
+    # is being initialised, and to avoid a tight coupling.
+    from .eccc_service import fetch_eccc_source
+
+    try:
+        eccc = fetch_eccc_source(
+            location.get("name"),
+            float(location.get("latitude", 0.0)),
+            float(location.get("longitude", 0.0)),
+        )
+    except Exception as err:
+        eccc = {
+            "source_id": "eccc",
+            "source_name": "Environment and Climate Change Canada",
+            "attribution_url": (
+                "https://eccc-msc.github.io/open-data/msc-data/citypage-weather/"
+                "readme_citypageweather_en/"
+            ),
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "current": None,
+            "hourly_next_24h": [],
+            "daily_7d": [],
+            "error": f"Unhandled ECCC error: {err}",
+        }
+    response["sources"].append(eccc)
+    return response
+
+
 def get_weather(latitude: float, longitude: float, timezone: str = "auto") -> dict:
     request = ForecastRequest(latitude=latitude, longitude=longitude, timezone=timezone)
     raw = fetch_open_meteo_forecast(request)
-    return normalize_forecast_response(
-        raw,
-        {
-            "latitude": latitude,
-            "longitude": longitude,
-            "timezone": raw.get("timezone", timezone),
-        },
-    )
+    location = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "timezone": raw.get("timezone", timezone),
+    }
+    response = normalize_forecast_response(raw, location)
+    return _append_eccc_source(response, location)
 
 
 def get_myrnam_weather() -> dict:
@@ -546,4 +610,5 @@ def get_myrnam_weather() -> dict:
         timezone=MYRNAM["timezone"],
     )
     raw = fetch_open_meteo_forecast(request)
-    return normalize_forecast_response(raw, MYRNAM)
+    response = normalize_forecast_response(raw, MYRNAM)
+    return _append_eccc_source(response, MYRNAM)

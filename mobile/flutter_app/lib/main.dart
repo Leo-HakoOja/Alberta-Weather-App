@@ -544,6 +544,7 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
           final daily7 = (weatherData['daily_7d'] as List<dynamic>? ?? []);
           final daily14 =
               (weatherData['daily_14d_extended'] as List<dynamic>? ?? []);
+          final sources = (weatherData['sources'] as List<dynamic>? ?? const []);
           final dayparts =
               (weatherData['dayparts_14d'] as List<dynamic>? ?? const []);
           final daypartsByDate = <String, Map<String, dynamic>>{
@@ -576,6 +577,7 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
                       ),
                       radarFuture: _radarFuture,
                       onRadarTap: _openRadarViewer,
+                      sources: sources,
                     ),
                     const SizedBox(height: 16),
                     _SectionHeader(title: 'Highlights'),
@@ -943,6 +945,7 @@ class _HeroCurrentCard extends StatelessWidget {
     required this.todayForecast,
     required this.radarFuture,
     required this.onRadarTap,
+    required this.sources,
   });
 
   final Map<String, dynamic> location;
@@ -951,6 +954,7 @@ class _HeroCurrentCard extends StatelessWidget {
   final Map<String, dynamic>? todayForecast;
   final Future<_RadarTimeline> radarFuture;
   final VoidCallback onRadarTap;
+  final List<dynamic> sources;
 
   @override
   Widget build(BuildContext context) {
@@ -1031,6 +1035,10 @@ class _HeroCurrentCard extends StatelessWidget {
                       color: Colors.white,
                     ),
                   ),
+                  if (sources.length >= 2) ...[
+                    const SizedBox(height: 8),
+                    _SourceComparisonStrip(sources: sources),
+                  ],
                   const SizedBox(height: 2),
                   Text(
                     weather,
@@ -1071,6 +1079,78 @@ class _HeroCurrentCard extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+class _SourceComparisonStrip extends StatelessWidget {
+  const _SourceComparisonStrip({required this.sources});
+
+  final List<dynamic> sources;
+
+  static const Map<String, String> _shortLabels = {
+    'open-meteo': 'Open-Meteo',
+    'eccc': 'ECCC',
+    'apple-weatherkit': 'WeatherKit',
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final chips = <Widget>[];
+    for (final raw in sources) {
+      if (raw is! Map) continue;
+      final source = raw.cast<String, dynamic>();
+      final id = '${source['source_id'] ?? ''}';
+      final label = _shortLabels[id] ?? id;
+      final current = source['current'] as Map<String, dynamic>?;
+      final temp = current?['temperature'];
+      final error = source['error'];
+      final tempText = (temp is num) ? '${temp.toStringAsFixed(0)}°' : '—';
+
+      chips.add(
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+          decoration: BoxDecoration(
+            color: error == null
+                ? Colors.white.withValues(alpha: 0.18)
+                : Colors.white.withValues(alpha: 0.08),
+            borderRadius: BorderRadius.circular(999),
+            border: Border.all(
+              color: Colors.white.withValues(alpha: 0.25),
+              width: 0.5,
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                label,
+                style: theme.textTheme.labelSmall?.copyWith(
+                  color: Colors.white70,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(width: 6),
+              Text(
+                error == null ? tempText : '—',
+                style: theme.textTheme.labelMedium?.copyWith(
+                  color: Colors.white,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (chips.isEmpty) return const SizedBox.shrink();
+
+    return Wrap(
+      spacing: 6,
+      runSpacing: 6,
+      children: chips,
     );
   }
 }

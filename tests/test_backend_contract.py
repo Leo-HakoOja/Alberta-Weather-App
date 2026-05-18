@@ -79,7 +79,7 @@ class WeatherServiceContractTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(data["schema_version"], "1.0.0")
+        self.assertEqual(data["schema_version"], "1.1.0")
         self.assertIn("generated_at", data)
         self.assertIn("location", data)
         self.assertIn("units", data)
@@ -88,6 +88,7 @@ class WeatherServiceContractTests(unittest.TestCase):
         self.assertIn("daily_7d", data)
         self.assertIn("daily_14d_extended", data)
         self.assertIn("dayparts_14d", data)
+        self.assertIn("sources", data)
 
         self.assertEqual(len(data["hourly_next_24h"]), 21)
         self.assertEqual(data["hourly_next_24h"][0]["time"], "2026-04-01T03:00")
@@ -101,8 +102,20 @@ class WeatherServiceContractTests(unittest.TestCase):
         self.assertIsNotNone(data["current"]["sunrise"])
         self.assertIsNotNone(data["current"]["sunset"])
 
+        # normalize_forecast_response always seeds the Open-Meteo source.
+        self.assertEqual(len(data["sources"]), 1)
+        self.assertEqual(data["sources"][0]["source_id"], "open-meteo")
+        self.assertEqual(
+            data["sources"][0]["current"]["temperature"],
+            data["current"]["temperature"],
+        )
+        self.assertEqual(
+            len(data["sources"][0]["hourly_next_24h"]), len(data["hourly_next_24h"])
+        )
+
         validated = WeatherResponse.model_validate(data)
-        self.assertEqual(validated.schema_version, "1.0.0")
+        self.assertEqual(validated.schema_version, "1.1.0")
+        self.assertEqual(len(validated.sources), 1)
 
     def test_forecast_fetch_uses_in_memory_cache(self) -> None:
         payload = _sample_raw()
@@ -176,6 +189,131 @@ class ApiEndpointTests(unittest.TestCase):
             longitude=-111.23504,
             timezone="America/Edmonton",
         )
+
+
+class EcccSourceTests(unittest.TestCase):
+    """ECCC adapter tests — uses mocked HTTP, never hits the network."""
+
+    def _sample_eccc_payload(self) -> dict:
+        return {
+            "properties": {
+                "currentConditions": {
+                    "timestamp": {"en": "2026-05-18T01:00:00Z"},
+                    "temperature": {"value": {"en": 11.5}},
+                    "windChill": {"value": {"en": -4}},
+                    "relativeHumidity": {"value": {"en": 40}},
+                    "wind": {
+                        "speed": {"value": {"en": 2}},
+                        "direction": {"value": {"en": "N"}},
+                        "bearing": {"value": {"en": 350.7}},
+                    },
+                    "condition": {"en": "Mostly cloudy"},
+                    "iconCode": {"value": 6},
+                },
+                "forecastGroup": {
+                    "forecasts": [
+                        {
+                            "period": {"textForecastName": {"en": "Tonight"}},
+                            "temperatures": {
+                                "temperature": [
+                                    {"class": {"en": "low"}, "value": {"en": 0}}
+                                ],
+                                "textSummary": {"en": "Low zero with patchy frost."},
+                            },
+                        },
+                        {
+                            "period": {"textForecastName": {"en": "Monday"}},
+                            "temperatures": {
+                                "temperature": [
+                                    {"class": {"en": "high"}, "value": {"en": 15}}
+                                ],
+                                "textSummary": {"en": "High 15."},
+                            },
+                        },
+                        {
+                            "period": {"textForecastName": {"en": "Monday night"}},
+                            "temperatures": {
+                                "temperature": [
+                                    {"class": {"en": "low"}, "value": {"en": 3}}
+                                ],
+                                "textSummary": {"en": "Low plus 3."},
+                            },
+                        },
+                    ],
+                },
+                "hourlyForecastGroup": {
+                    "hourlyForecasts": [
+                        {
+                            "timestamp": "2026-05-18T02:00:00Z",
+                            "condition": {"en": "Chance of showers"},
+                            "temperature": {"value": {"en": 10}},
+                            "iconCode": {"value": 6},
+                            "lop": {"value": {"en": 30}},
+                            "wind": {
+                                "speed": {"value": {"en": 10}},
+                                "direction": {"value": {"en": "NE"}},
+                                "bearing": {"value": {"en": 45}},
+                            },
+                        }
+                    ],
+                },
+            }
+        }
+
+    def test_eccc_normalization_shape(self) -> None:
+        from backend.app import eccc_service
+        from backend.app.schemas import SourceForecast
+
+        eccc_service._site_cache.clear()
+        sample = self._sample_eccc_payload()
+
+        with patch(
+            "backend.app.eccc_service._http_get_json", return_value=sample
+        ):
+            result = eccc_service.fetch_eccc_source("Myrnam", 53.66686, -111.23504)
+
+        self.assertEqual(result["source_id"], "eccc")
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["current"]["temperature"], 11.5)
+        self.assertEqual(result["current"]["apparent_temperature"], -4)
+        self.assertEqual(result["current"]["wind_direction_compass"], "N")
+        self.assertEqual(len(result["hourly_next_24h"]), 1)
+        self.assertEqual(
+            result["hourly_next_24h"][0]["precipitation_probability"], 30
+        )
+        # Daily collapse: "Tonight" + "Monday day" + "Monday night" = 2 dated buckets.
+        self.assertGreaterEqual(len(result["daily_7d"]), 2)
+        monday = result["daily_7d"][1]
+        self.assertEqual(monday["temperature_max"], 15)
+        self.assertEqual(monday["temperature_min"], 3)
+
+        SourceForecast.model_validate(result)
+
+    def test_eccc_returns_error_stub_outside_alberta(self) -> None:
+        from backend.app import eccc_service
+
+        eccc_service._site_cache.clear()
+        eccc_service._alberta_sites_cache = None
+
+        # Mock the bbox fetch to return an empty list so resolve_site_code falls
+        # through to "None" without hitting the network.
+        with patch(
+            "backend.app.eccc_service._http_get_json",
+            return_value={"features": []},
+        ):
+            result = eccc_service.fetch_eccc_source("Phoenix", 33.45, -112.07)
+
+        self.assertEqual(result["source_id"], "eccc")
+        self.assertIsNotNone(result["error"])
+        self.assertIsNone(result["current"])
+
+    def test_eccc_known_location_skips_bbox_lookup(self) -> None:
+        from backend.app import eccc_service
+
+        site_code = eccc_service.resolve_site_code(
+            "Edmonton", 53.54, -113.49
+        )
+        self.assertEqual(site_code, "ab-50")
 
 
 if __name__ == "__main__":

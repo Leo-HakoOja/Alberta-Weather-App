@@ -88,6 +88,17 @@ class DaypartsForecastItem(BaseModel):
     periods: dict[str, DaypartSummary | None]
 
 
+class SourceForecast(BaseModel):
+    source_id: str
+    source_name: str
+    attribution_url: str
+    fetched_at: str
+    current: CurrentConditions | None = None
+    hourly_next_24h: list[HourlyForecastItem] = []
+    daily_7d: list[DailyForecastItem] = []
+    error: str | None = None
+
+
 class WeatherResponse(BaseModel):
     location: Location
     units: UnitsBySection
@@ -96,6 +107,7 @@ class WeatherResponse(BaseModel):
     daily_7d: list[DailyForecastItem]
     daily_14d_extended: list[DailyForecastItem]
     dayparts_14d: list[DaypartsForecastItem]
+    sources: list[SourceForecast] = []
     schema_version: str
     generated_at: str
     source: str
