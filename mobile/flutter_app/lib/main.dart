@@ -2,8 +2,29 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_map/flutter_map.dart';
 import 'package:http/http.dart' as http;
+import 'package:latlong2/latlong.dart';
 import 'package:video_player/video_player.dart';
+
+class _RadarFrame {
+  const _RadarFrame({required this.path, required this.unixTime});
+
+  final String path;
+  final int unixTime;
+
+  String tileUrlTemplate() {
+    return 'https://tilecache.rainviewer.com$path/256/{z}/{x}/{y}/2/1_1.png';
+  }
+}
+
+class _RadarTimeline {
+  const _RadarTimeline({required this.frames});
+
+  final List<_RadarFrame> frames;
+
+  _RadarFrame? get latestOrNull => frames.isEmpty ? null : frames.last;
+}
 
 class _SavedLocation {
   const _SavedLocation({
@@ -109,9 +130,9 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
   );
 
   late Future<Map<String, dynamic>> _weatherFuture;
+  late Future<_RadarTimeline> _radarFuture;
   late List<_SavedLocation> _savedLocations;
   late _SavedLocation _selectedLocation;
-  String? _expandedForecastDate;
 
   @override
   void initState() {
@@ -119,6 +140,9 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
     _savedLocations = List<_SavedLocation>.from(_defaultSavedLocations);
     _selectedLocation = _savedLocations.first;
     _weatherFuture = _fetchWeather();
+    _radarFuture = _fetchRadarTimeline().catchError(
+      (_) => const _RadarTimeline(frames: []),
+    );
   }
 
   String _resolvedApiUrl() {
@@ -173,10 +197,57 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
     return decoded;
   }
 
+  Future<_RadarTimeline> _fetchRadarTimeline() async {
+    final response = await http.get(
+      Uri.parse('https://api.rainviewer.com/public/weather-maps.json'),
+    );
+    if (response.statusCode != 200) {
+      throw Exception('Radar source unavailable (${response.statusCode})');
+    }
+
+    final decoded = jsonDecode(response.body);
+    if (decoded is! Map<String, dynamic>) {
+      throw Exception('Unexpected radar response');
+    }
+
+    final radar = decoded['radar'] as Map<String, dynamic>? ?? const {};
+    final past = radar['past'] as List<dynamic>? ?? const [];
+    final nowcast = radar['nowcast'] as List<dynamic>? ?? const [];
+
+    List<_RadarFrame> parseFrames(List<dynamic> source) {
+      return source
+          .whereType<Map<String, dynamic>>()
+          .map((item) {
+            final path = item['path'];
+            final time = item['time'];
+            if (path is! String || time is! int) {
+              return null;
+            }
+            return _RadarFrame(path: path, unixTime: time);
+          })
+          .whereType<_RadarFrame>()
+          .toList();
+    }
+
+    // Use observed radar frames by default so map and forecast feel consistent.
+    final observedFrames = parseFrames(past);
+    final frames = observedFrames.isNotEmpty
+        ? observedFrames
+        : parseFrames(nowcast);
+
+    if (frames.isEmpty) {
+      throw Exception('No radar frames available');
+    }
+
+    return _RadarTimeline(frames: frames);
+  }
+
   Future<void> _refresh() async {
     setState(() {
-      _expandedForecastDate = null;
       _weatherFuture = _fetchWeather();
+      _radarFuture = _fetchRadarTimeline().catchError(
+        (_) => const _RadarTimeline(frames: []),
+      );
     });
     await _weatherFuture;
   }
@@ -192,7 +263,6 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
         _savedLocations = [..._savedLocations, location];
       }
       _selectedLocation = location;
-      _expandedForecastDate = null;
       _weatherFuture = _fetchWeather();
     });
   }
@@ -263,10 +333,127 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
     }
   }
 
-  void _toggleDayDetails(String date) {
-    setState(() {
-      _expandedForecastDate = _expandedForecastDate == date ? null : date;
-    });
+  Future<void> _openDayDetailsOverlay({
+    required Map<String, dynamic> day,
+    required Map<String, dynamic>? dayparts,
+    Offset? tapPosition,
+  }) async {
+    final media = MediaQuery.of(context);
+    final screenHeight = media.size.height;
+    final normalizedY = tapPosition == null
+        ? 0.5
+        : (tapPosition.dy / screenHeight).clamp(0.06, 0.94);
+    final alignmentY = (normalizedY * 2) - 1;
+
+    await showGeneralDialog<void>(
+      context: context,
+      barrierDismissible: true,
+      barrierLabel: 'Close day details',
+      barrierColor: Colors.black.withValues(alpha: 0.38),
+      transitionDuration: const Duration(milliseconds: 220),
+      pageBuilder: (dialogContext, _, _) {
+        return SafeArea(
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => Navigator.of(dialogContext).pop(),
+            child: Align(
+              alignment: Alignment(0, alignmentY),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 14),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 640),
+                  child: _InlineDayDetailsCard(day: day, dayparts: dayparts),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+      transitionBuilder: (_, animation, secondaryAnimation, child) {
+        final curved = CurvedAnimation(
+          parent: animation,
+          curve: Curves.easeOutCubic,
+          reverseCurve: Curves.easeInCubic,
+        );
+        return FadeTransition(
+          opacity: curved,
+          child: ScaleTransition(
+            scale: Tween<double>(begin: 0.94, end: 1).animate(curved),
+            child: child,
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _openHourlyDetailsOverlay(
+    Map<String, dynamic> item, {
+    Offset? tapPosition,
+  }) async {
+    final media = MediaQuery.of(context);
+    final screenHeight = media.size.height;
+    final normalizedY = tapPosition == null
+        ? 0.5
+        : (tapPosition.dy / screenHeight).clamp(0.06, 0.94);
+    final alignmentY = (normalizedY * 2) - 1;
+
+    await showGeneralDialog<void>(
+      context: context,
+      barrierDismissible: true,
+      barrierLabel: 'Close hourly details',
+      barrierColor: Colors.black.withValues(alpha: 0.38),
+      transitionDuration: const Duration(milliseconds: 220),
+      pageBuilder: (dialogContext, _, _) {
+        return SafeArea(
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => Navigator.of(dialogContext).pop(),
+            child: Align(
+              alignment: Alignment(0, alignmentY),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 14),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 640),
+                  child: _InlineHourlyDetailsCard(item: item),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+      transitionBuilder: (_, animation, secondaryAnimation, child) {
+        final curved = CurvedAnimation(
+          parent: animation,
+          curve: Curves.easeOutCubic,
+          reverseCurve: Curves.easeInCubic,
+        );
+        return FadeTransition(
+          opacity: curved,
+          child: ScaleTransition(
+            scale: Tween<double>(begin: 0.94, end: 1).animate(curved),
+            child: child,
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _openRadarViewer() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) {
+        return FractionallySizedBox(
+          heightFactor: 0.92,
+          child: _RadarViewerSheet(
+            timelineFuture: _radarFuture,
+            location: _selectedLocation,
+          ),
+        );
+      },
+    );
   }
 
   Map<String, dynamic>? _todayForecast({
@@ -387,6 +574,8 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
                         daily7: daily7,
                         daily14: daily14,
                       ),
+                      radarFuture: _radarFuture,
+                      onRadarTap: _openRadarViewer,
                     ),
                     const SizedBox(height: 16),
                     _SectionHeader(title: 'Highlights'),
@@ -402,8 +591,13 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
                         itemCount: hourly.length > 24 ? 24 : hourly.length,
                         separatorBuilder: (_, _) => const SizedBox(width: 10),
                         itemBuilder: (context, index) {
+                          final item = hourly[index] as Map<String, dynamic>;
                           return _HourlyTile(
-                            item: hourly[index] as Map<String, dynamic>,
+                            item: item,
+                            onTapUp: (tapPosition) => _openHourlyDetailsOverlay(
+                              item,
+                              tapPosition: tapPosition,
+                            ),
                           );
                         },
                       ),
@@ -411,43 +605,33 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
                     const SizedBox(height: 20),
                     _SectionHeader(title: '7-Day Forecast'),
                     const SizedBox(height: 8),
-                    ...daily7.whereType<Map<String, dynamic>>().expand((item) {
+                    ...daily7.whereType<Map<String, dynamic>>().map((item) {
                       final dateKey = '${item['date'] ?? ''}';
-                      final isExpanded = _expandedForecastDate == dateKey;
-                      return [
-                        _DailyForecastRow(
-                          item: item,
-                          theme: theme,
-                          isExpanded: isExpanded,
-                          onTap: () => _toggleDayDetails(dateKey),
-                        ),
-                        _InlineDayDetailsCard(
-                          visible: isExpanded,
+                      return _DailyForecastRow(
+                        item: item,
+                        theme: theme,
+                        onTapUp: (tapPosition) => _openDayDetailsOverlay(
                           day: item,
                           dayparts: daypartsByDate[dateKey],
+                          tapPosition: tapPosition,
                         ),
-                      ];
+                      );
                     }),
                     const SizedBox(height: 20),
                     _SectionHeader(title: '14-Day Extended'),
                     const SizedBox(height: 8),
-                    ...daily14.whereType<Map<String, dynamic>>().expand((item) {
+                    ...daily14.whereType<Map<String, dynamic>>().map((item) {
                       final dateKey = '${item['date'] ?? ''}';
-                      final isExpanded = _expandedForecastDate == dateKey;
-                      return [
-                        _DailyForecastRow(
-                          item: item,
-                          theme: theme,
-                          compact: true,
-                          isExpanded: isExpanded,
-                          onTap: () => _toggleDayDetails(dateKey),
-                        ),
-                        _InlineDayDetailsCard(
-                          visible: isExpanded,
+                      return _DailyForecastRow(
+                        item: item,
+                        theme: theme,
+                        compact: true,
+                        onTapUp: (tapPosition) => _openDayDetailsOverlay(
                           day: item,
                           dayparts: daypartsByDate[dateKey],
+                          tapPosition: tapPosition,
                         ),
-                      ];
+                      );
                     }),
                   ],
                 ),
@@ -757,12 +941,16 @@ class _HeroCurrentCard extends StatelessWidget {
     required this.current,
     required this.selectedLocation,
     required this.todayForecast,
+    required this.radarFuture,
+    required this.onRadarTap,
   });
 
   final Map<String, dynamic> location;
   final Map<String, dynamic> current;
   final _SavedLocation selectedLocation;
   final Map<String, dynamic>? todayForecast;
+  final Future<_RadarTimeline> radarFuture;
+  final VoidCallback onRadarTap;
 
   @override
   Widget build(BuildContext context) {
@@ -786,73 +974,360 @@ class _HeroCurrentCard extends StatelessWidget {
       ),
       child: Padding(
         padding: const EdgeInsets.all(18),
-        child: Column(
+        child: Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              '$locationName, $province',
-              style: theme.textTheme.titleLarge?.copyWith(
-                fontWeight: FontWeight.w700,
-                color: Colors.white,
-              ),
-            ),
-            const SizedBox(height: 2),
-            Text(
-              'Built for Alberta days',
-              style: theme.textTheme.labelMedium?.copyWith(color: Colors.white),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              '${current['time'] ?? ''}',
-              style: theme.textTheme.bodySmall?.copyWith(color: Colors.white70),
-            ),
-            const SizedBox(height: 14),
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.end,
-              children: [
-                _weatherGlyph(
-                  weather,
-                  current['weather_code'],
-                  current['is_daylight'],
-                  32,
-                ),
-                const SizedBox(width: 10),
-                Text(
-                  '${_fmt(current['temperature'])}°C',
-                  style: theme.textTheme.displaySmall?.copyWith(
-                    fontWeight: FontWeight.w700,
-                    height: 1,
-                    color: Colors.white,
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '$locationName, $province',
+                    style: theme.textTheme.titleLarge?.copyWith(
+                      fontWeight: FontWeight.w700,
+                      color: Colors.white,
+                    ),
                   ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Text(
-              'H ${_fmt(todayForecast?['temperature_max'])}°C   L ${_fmt(todayForecast?['temperature_min'])}°C',
-              style: theme.textTheme.titleMedium?.copyWith(color: Colors.white),
-            ),
-            const SizedBox(height: 2),
-            Text(
-              weather,
-              style: theme.textTheme.titleMedium?.copyWith(color: Colors.white),
-            ),
-            const SizedBox(height: 2),
-            Text(
-              'Feels like ${_fmt(current['apparent_temperature'])}°C',
-              style: theme.textTheme.bodyMedium?.copyWith(
-                color: Colors.white70,
+                  const SizedBox(height: 2),
+                  Text(
+                    'Built for Alberta days',
+                    style: theme.textTheme.labelMedium?.copyWith(
+                      color: Colors.white,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    '${current['time'] ?? ''}',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: Colors.white70,
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      _weatherGlyph(
+                        weather,
+                        current['weather_code'],
+                        current['is_daylight'],
+                        _scaledGlyphSize(32),
+                        current['time'],
+                      ),
+                      const SizedBox(width: 10),
+                      Text(
+                        '${_fmt(current['temperature'])}°C',
+                        style: theme.textTheme.displaySmall?.copyWith(
+                          fontWeight: FontWeight.w700,
+                          height: 1,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'H ${_fmt(todayForecast?['temperature_max'])}°C   L ${_fmt(todayForecast?['temperature_min'])}°C',
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      color: Colors.white,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    weather,
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      color: Colors.white,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    'Feels like ${_fmt(current['apparent_temperature'])}°C',
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: Colors.white70,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    'Sunrise ${_fmtClockFromIso(current['sunrise'])}   Sunset ${_fmtClockFromIso(current['sunset'])}',
+                    maxLines: 1,
+                    softWrap: false,
+                    overflow: TextOverflow.fade,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: Colors.white70,
+                    ),
+                  ),
+                ],
               ),
             ),
-            const SizedBox(height: 2),
-            Text(
-              'Sunrise ${_fmtClockFromIso(current['sunrise'])}   Sunset ${_fmtClockFromIso(current['sunset'])}',
-              style: theme.textTheme.bodyMedium?.copyWith(
-                color: Colors.white70,
+            const SizedBox(width: 12),
+            SizedBox(
+              width: 132,
+              height: 160,
+              child: _RadarPreviewCard(
+                timelineFuture: radarFuture,
+                location: selectedLocation,
+                onTap: onRadarTap,
               ),
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _RadarPreviewCard extends StatelessWidget {
+  const _RadarPreviewCard({
+    required this.timelineFuture,
+    required this.location,
+    required this.onTap,
+  });
+
+  final Future<_RadarTimeline> timelineFuture;
+  final _SavedLocation location;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(16),
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            FutureBuilder<_RadarTimeline>(
+              future: timelineFuture,
+              builder: (context, snapshot) {
+                if (!snapshot.hasData || snapshot.data!.latestOrNull == null) {
+                  return Container(
+                    color: Colors.black.withValues(alpha: 0.25),
+                    alignment: Alignment.center,
+                    child: const Icon(Icons.radar, color: Colors.white70),
+                  );
+                }
+                return FlutterMap(
+                  options: MapOptions(
+                    initialCenter: LatLng(
+                      location.latitude,
+                      location.longitude,
+                    ),
+                    initialZoom: 6,
+                    interactionOptions: const InteractionOptions(
+                      flags: InteractiveFlag.none,
+                    ),
+                  ),
+                  children: [
+                    TileLayer(
+                      urlTemplate:
+                          'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                      userAgentPackageName: 'ca.alberta.weather',
+                    ),
+                    TileLayer(
+                      urlTemplate: snapshot.data!.latestOrNull!
+                          .tileUrlTemplate(),
+                    ),
+                  ],
+                );
+              },
+            ),
+            DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: RadialGradient(
+                  center: Alignment.center,
+                  radius: 1.0,
+                  colors: [
+                    Colors.transparent,
+                    Colors.black.withValues(alpha: 0.44),
+                  ],
+                  stops: const [0.55, 1],
+                ),
+              ),
+            ),
+            Positioned(
+              right: 8,
+              bottom: 8,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.4),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: const Text(
+                  'Radar',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _RadarViewerSheet extends StatefulWidget {
+  const _RadarViewerSheet({
+    required this.timelineFuture,
+    required this.location,
+  });
+
+  final Future<_RadarTimeline> timelineFuture;
+  final _SavedLocation location;
+
+  @override
+  State<_RadarViewerSheet> createState() => _RadarViewerSheetState();
+}
+
+class _RadarViewerSheetState extends State<_RadarViewerSheet> {
+  Timer? _timer;
+  int _frameIndex = 0;
+  bool _playing = false;
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  void _togglePlay(int max) {
+    if (_playing) {
+      _timer?.cancel();
+      setState(() => _playing = false);
+      return;
+    }
+
+    setState(() => _playing = true);
+    _timer = Timer.periodic(const Duration(milliseconds: 550), (_) {
+      if (!mounted) return;
+      setState(() {
+        _frameIndex = (_frameIndex + 1) % max;
+      });
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: const BoxDecoration(
+        color: Color(0xFF071F45),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      child: FutureBuilder<_RadarTimeline>(
+        future: widget.timelineFuture,
+        builder: (context, snapshot) {
+          if (!snapshot.hasData) {
+            return const Center(child: CircularProgressIndicator());
+          }
+
+          final frames = snapshot.data!.frames;
+          if (frames.isEmpty) {
+            return const Center(
+              child: Text(
+                'Radar temporarily unavailable.',
+                style: TextStyle(color: Colors.white70),
+              ),
+            );
+          }
+          if (_frameIndex >= frames.length) {
+            _frameIndex = frames.length - 1;
+          }
+          final frame = frames[_frameIndex];
+          final dt = DateTime.fromMillisecondsSinceEpoch(
+            frame.unixTime * 1000,
+            isUtc: true,
+          ).toLocal();
+
+          return Column(
+            children: [
+              const SizedBox(height: 8),
+              Container(
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.white30,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
+                child: Row(
+                  children: [
+                    const Icon(Icons.radar, color: Colors.white),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Radar • ${widget.location.name}, ${widget.location.province}',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w700,
+                          fontSize: 16,
+                        ),
+                      ),
+                    ),
+                    Text(
+                      '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}',
+                      style: const TextStyle(color: Colors.white70),
+                    ),
+                  ],
+                ),
+              ),
+              Expanded(
+                child: FlutterMap(
+                  options: MapOptions(
+                    initialCenter: LatLng(
+                      widget.location.latitude,
+                      widget.location.longitude,
+                    ),
+                    initialZoom: 6,
+                  ),
+                  children: [
+                    TileLayer(
+                      urlTemplate:
+                          'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                      userAgentPackageName: 'ca.alberta.weather',
+                    ),
+                    TileLayer(urlTemplate: frame.tileUrlTemplate()),
+                  ],
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(10, 8, 10, 16),
+                child: Row(
+                  children: [
+                    IconButton(
+                      onPressed: () => _togglePlay(frames.length),
+                      icon: Icon(
+                        _playing ? Icons.pause_circle : Icons.play_circle,
+                        color: Colors.white,
+                        size: 34,
+                      ),
+                    ),
+                    Expanded(
+                      child: Slider(
+                        value: _frameIndex.toDouble(),
+                        min: 0,
+                        max: (frames.length - 1).toDouble(),
+                        divisions: frames.length > 1 ? frames.length - 1 : 1,
+                        activeColor: _albertaGold,
+                        onChanged: (value) {
+                          _timer?.cancel();
+                          setState(() {
+                            _playing = false;
+                            _frameIndex = value.round();
+                          });
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          );
+        },
       ),
     );
   }
@@ -953,9 +1428,10 @@ class _SectionHeader extends StatelessWidget {
 }
 
 class _HourlyTile extends StatelessWidget {
-  const _HourlyTile({required this.item});
+  const _HourlyTile({required this.item, this.onTapUp});
 
   final Map<String, dynamic> item;
+  final ValueChanged<Offset>? onTapUp;
 
   @override
   Widget build(BuildContext context) {
@@ -963,47 +1439,155 @@ class _HourlyTile extends StatelessWidget {
     final popValue = _toDouble(pop);
     final hasPrecip = popValue != null && popValue > 0;
 
-    return Container(
-      width: 108,
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
         borderRadius: BorderRadius.circular(14),
-        color: _albertaBlue,
+        onTapUp: (details) => onTapUp?.call(details.globalPosition),
+        child: Ink(
+          width: 112,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(14),
+            color: _albertaBlue,
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Text(
+                '${item['label'] ?? '-'}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+                style: Theme.of(
+                  context,
+                ).textTheme.labelLarge?.copyWith(color: Colors.white),
+              ),
+              Expanded(
+                child: Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _weatherGlyph(
+                        '${item['weather'] ?? ''}',
+                        item['weather_code'],
+                        item['is_daylight'],
+                        _scaledGlyphSize(26),
+                        item['time'],
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        '${_fmt(item['temperature'])}°C',
+                        style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              if (hasPrecip)
+                Text(
+                  'Rain ${_fmtPercent(pop)}',
+                  style: Theme.of(
+                    context,
+                  ).textTheme.labelSmall?.copyWith(color: Colors.white70),
+                )
+              else
+                const SizedBox(height: 16),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _InlineHourlyDetailsCard extends StatelessWidget {
+  const _InlineHourlyDetailsCard({required this.item});
+
+  final Map<String, dynamic> item;
+
+  @override
+  Widget build(BuildContext context) {
+    final directionCompass = '${item['wind_direction_compass'] ?? '-'}';
+    final directionDegrees = _fmt(item['wind_direction_degrees']);
+    final direction = directionDegrees == '-'
+        ? directionCompass
+        : '$directionCompass ($directionDegrees°)';
+
+    final metrics = [
+      ('Feels like', '${_fmt(item['apparent_temperature'])}°C'),
+      ('Humidity', _fmtPercent(item['humidity'])),
+      ('Wind', '${_fmt(item['wind_speed'])} km/h'),
+      ('Direction', direction),
+      ('UV Index', _fmt(item['uv_index'])),
+      ('Rain chance', _fmtPercent(item['precipitation_probability'])),
+    ];
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+      decoration: BoxDecoration(
+        color: const Color(0xF20A2E66),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.white24),
       ),
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            '${item['label'] ?? '-'}',
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: Theme.of(
-              context,
-            ).textTheme.labelLarge?.copyWith(color: Colors.white),
+          Row(
+            children: [
+              _weatherGlyph(
+                '${item['weather'] ?? ''}',
+                item['weather_code'],
+                item['is_daylight'],
+                _scaledGlyphSize(30),
+                item['time'],
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '${item['label'] ?? 'Hourly details'}',
+                      style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white,
+                      ),
+                    ),
+                    Text(
+                      '${item['weather'] ?? '-'} • ${_fmt(item['temperature'])}°C',
+                      style: Theme.of(
+                        context,
+                      ).textTheme.bodyMedium?.copyWith(color: Colors.white70),
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ),
-          const SizedBox(height: 6),
-          _weatherGlyph(
-            '${item['weather'] ?? ''}',
-            item['weather_code'],
-            item['is_daylight'],
-            20,
-          ),
-          const SizedBox(height: 4),
-          Text(
-            '${_fmt(item['temperature'])}°C',
-            style: Theme.of(context).textTheme.titleMedium?.copyWith(
-              fontWeight: FontWeight.w700,
-              color: Colors.white,
+          const SizedBox(height: 12),
+          GridView.builder(
+            shrinkWrap: true,
+            physics: const NeverScrollableScrollPhysics(),
+            itemCount: metrics.length,
+            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: 2,
+              crossAxisSpacing: 8,
+              mainAxisSpacing: 8,
+              childAspectRatio: 2.2,
             ),
+            itemBuilder: (context, index) {
+              return _MetricCard(
+                label: metrics[index].$1,
+                value: metrics[index].$2,
+              );
+            },
           ),
-          const Spacer(),
-          if (hasPrecip)
-            Text(
-              'Rain ${_fmt(pop)}%',
-              style: Theme.of(
-                context,
-              ).textTheme.labelSmall?.copyWith(color: Colors.white70),
-            ),
         ],
       ),
     );
@@ -1015,15 +1599,13 @@ class _DailyForecastRow extends StatelessWidget {
     required this.item,
     required this.theme,
     this.compact = false,
-    this.isExpanded = false,
-    this.onTap,
+    this.onTapUp,
   });
 
   final Map<String, dynamic> item;
   final ThemeData theme;
   final bool compact;
-  final bool isExpanded;
-  final VoidCallback? onTap;
+  final ValueChanged<Offset>? onTapUp;
 
   @override
   Widget build(BuildContext context) {
@@ -1047,7 +1629,16 @@ class _DailyForecastRow extends StatelessWidget {
       margin: const EdgeInsets.only(bottom: 8),
       child: InkWell(
         borderRadius: BorderRadius.circular(12),
-        onTap: onTap,
+        onTapUp: (_) {
+          final box = context.findRenderObject() as RenderBox?;
+          if (box == null) return;
+          final topLeft = box.localToGlobal(Offset.zero);
+          final center = Offset(
+            topLeft.dx + (box.size.width / 2),
+            topLeft.dy + (box.size.height / 2),
+          );
+          onTapUp?.call(center);
+        },
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
           child: Row(
@@ -1070,7 +1661,8 @@ class _DailyForecastRow extends StatelessWidget {
                       '${item['weather'] ?? ''}',
                       item['weather_code'],
                       item['is_daylight'],
-                      18,
+                      _scaledGlyphSize(18),
+                      item['date'],
                     ),
                     const SizedBox(width: 6),
                     Expanded(
@@ -1098,6 +1690,9 @@ class _DailyForecastRow extends StatelessWidget {
                             style: theme.textTheme.bodySmall?.copyWith(
                               color: Colors.white,
                               fontWeight: FontWeight.w600,
+                              fontSize:
+                                  (theme.textTheme.bodySmall?.fontSize ?? 12) *
+                                  0.9,
                             ),
                           ),
                           Text(
@@ -1143,13 +1738,8 @@ class _DailyForecastRow extends StatelessWidget {
 }
 
 class _InlineDayDetailsCard extends StatelessWidget {
-  const _InlineDayDetailsCard({
-    required this.visible,
-    required this.day,
-    required this.dayparts,
-  });
+  const _InlineDayDetailsCard({required this.day, required this.dayparts});
 
-  final bool visible;
   final Map<String, dynamic> day;
   final Map<String, dynamic>? dayparts;
 
@@ -1158,57 +1748,51 @@ class _InlineDayDetailsCard extends StatelessWidget {
     final periods =
         (dayparts?['periods'] as Map<String, dynamic>? ?? <String, dynamic>{});
 
-    return AnimatedSize(
-      duration: const Duration(milliseconds: 220),
-      curve: Curves.easeInOut,
-      alignment: Alignment.topCenter,
-      child: visible
-          ? Container(
-              margin: const EdgeInsets.only(bottom: 10),
-              padding: const EdgeInsets.fromLTRB(10, 8, 10, 6),
-              decoration: BoxDecoration(
-                color: const Color(0xCC0A2E66),
-                borderRadius: BorderRadius.circular(14),
-                border: Border.all(color: Colors.white24),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    '${day['label'] ?? day['date'] ?? 'Day details'}',
-                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                      color: Colors.white,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    '${day['weather'] ?? '-'} • H ${_fmt(day['temperature_max'])}°C / L ${_fmt(day['temperature_min'])}°C',
-                    style: Theme.of(
-                      context,
-                    ).textTheme.bodySmall?.copyWith(color: Colors.white70),
-                  ),
-                  const SizedBox(height: 8),
-                  _DayPeriodTile(
-                    title: 'Overnight',
-                    data: periods['overnight'] as Map<String, dynamic>?,
-                  ),
-                  _DayPeriodTile(
-                    title: 'Morning',
-                    data: periods['morning'] as Map<String, dynamic>?,
-                  ),
-                  _DayPeriodTile(
-                    title: 'Afternoon',
-                    data: periods['afternoon'] as Map<String, dynamic>?,
-                  ),
-                  _DayPeriodTile(
-                    title: 'Evening',
-                    data: periods['evening'] as Map<String, dynamic>?,
-                  ),
-                ],
-              ),
-            )
-          : const SizedBox.shrink(),
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.fromLTRB(10, 8, 10, 6),
+      decoration: BoxDecoration(
+        color: const Color(0xF20A2E66),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.white24),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '${day['label'] ?? day['date'] ?? 'Day details'}',
+            style: Theme.of(context).textTheme.titleMedium?.copyWith(
+              color: Colors.white,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            '${day['weather'] ?? '-'} • H ${_fmt(day['temperature_max'])}°C / L ${_fmt(day['temperature_min'])}°C',
+            style: Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(color: Colors.white70),
+          ),
+          const SizedBox(height: 8),
+          _DayPeriodTile(
+            title: 'Overnight',
+            data: periods['overnight'] as Map<String, dynamic>?,
+          ),
+          _DayPeriodTile(
+            title: 'Morning',
+            data: periods['morning'] as Map<String, dynamic>?,
+          ),
+          _DayPeriodTile(
+            title: 'Afternoon',
+            data: periods['afternoon'] as Map<String, dynamic>?,
+          ),
+          _DayPeriodTile(
+            title: 'Evening',
+            data: periods['evening'] as Map<String, dynamic>?,
+          ),
+        ],
+      ),
     );
   }
 }
@@ -1253,12 +1837,13 @@ class _DayPeriodTile extends StatelessWidget {
               ),
             ),
             SizedBox(
-              width: 30,
+              width: _scaledGlyphSize(30),
               child: _weatherGlyph(
                 weather,
                 weatherCode,
                 data?['is_daylight'],
-                20,
+                _scaledGlyphSize(20),
+                data?['time'] ?? data?['date'],
               ),
             ),
             const SizedBox(width: 8),
@@ -1315,6 +1900,11 @@ String _fmt(dynamic value) {
   return parsed.round().toString();
 }
 
+String _fmtPercent(dynamic value) {
+  final formatted = _fmt(value);
+  return formatted == '-' ? '-' : '$formatted%';
+}
+
 String _fmtMm(dynamic value) {
   final parsed = _toDouble(value);
   if (parsed == null) {
@@ -1359,80 +1949,352 @@ bool _isSnowWeather(String weather) {
   return w.contains('snow') || w.contains('blizzard') || w.contains('sleet');
 }
 
+enum _WeatherGlyphKind {
+  thunder,
+  snow,
+  rain,
+  fog,
+  overcast,
+  partlyCloudyDay,
+  partlyCloudyNight,
+  clearDay,
+  clearNight,
+}
+
+const double _glyphScale = 1.35;
+
+double _scaledGlyphSize(double baseSize) => baseSize * _glyphScale;
+
 Widget _weatherGlyph(
   String weather, [
   dynamic weatherCode,
   dynamic isDaylightValue,
   double size = 20,
+  dynamic timeValue,
 ]) {
+  final kind = _resolveWeatherGlyphKind(weather, weatherCode, isDaylightValue);
+  return _buildWeatherGlyph(kind: kind, size: size, timeValue: timeValue);
+}
+
+_WeatherGlyphKind _resolveWeatherGlyphKind(
+  String weather,
+  dynamic weatherCode,
+  dynamic isDaylightValue,
+) {
   final w = weather.toLowerCase();
   final code = weatherCode is int ? weatherCode : int.tryParse('$weatherCode');
   final isDaylight = isDaylightValue is bool ? isDaylightValue : null;
 
-  bool isThunder =
+  final isThunder =
       w.contains('thunder') || code == 95 || code == 96 || code == 99;
-  bool isSnow = w.contains('snow') || _isSnowWeatherCode(code);
-  bool isRain =
+  final isSnow = w.contains('snow') || _isSnowWeatherCode(code);
+  final isRain =
       w.contains('rain') ||
       w.contains('drizzle') ||
       {51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82}.contains(code);
-  bool isFog = w.contains('fog') || code == 45 || code == 48;
-  bool isOvercast = w.contains('overcast') || code == 3;
-  bool isPartlyCloudy = w.contains('partly cloudy') || code == 2;
-  bool isMainlyClear = w.contains('mainly clear') || code == 1;
-  bool isClear = w.contains('clear') || code == 0;
-  bool isCloudyFallback = w.contains('cloud');
+  final isFog = w.contains('fog') || code == 45 || code == 48;
+  final isOvercast = w.contains('overcast') || code == 3;
+  final isPartlyCloudy =
+      w.contains('partly cloudy') || w.contains('cloud') || code == 2;
+  final isMainlyClear = w.contains('mainly clear') || code == 1;
+  final isClear = w.contains('clear') || code == 0;
 
-  if (isThunder) return Text('⛈️', style: TextStyle(fontSize: size));
-  if (isSnow) return Text('❄️', style: TextStyle(fontSize: size));
-  if (isRain) return Text('🌧️', style: TextStyle(fontSize: size));
-  if (isFog) return Text('🌫️', style: TextStyle(fontSize: size));
-  if (isOvercast) return Text('☁️', style: TextStyle(fontSize: size));
+  if (isThunder) return _WeatherGlyphKind.thunder;
+  if (isSnow) return _WeatherGlyphKind.snow;
+  if (isRain) return _WeatherGlyphKind.rain;
+  if (isFog) return _WeatherGlyphKind.fog;
+  if (isOvercast) return _WeatherGlyphKind.overcast;
 
-  if ((isPartlyCloudy || isCloudyFallback) && isDaylight == false) {
-    return _cloudMoonGlyph(size: size);
-  }
-  if ((isMainlyClear || isClear) && isDaylight == false) {
-    return _moonStarGlyph(size: size);
-  }
-
-  if (isPartlyCloudy || isCloudyFallback) {
-    return Text('⛅', style: TextStyle(fontSize: size));
-  }
-  if (isMainlyClear) {
-    return Text('🌤️', style: TextStyle(fontSize: size));
-  }
-  if (isClear) {
-    return Text('☀️', style: TextStyle(fontSize: size));
+  if (isDaylight == false) {
+    if (isPartlyCloudy) return _WeatherGlyphKind.partlyCloudyNight;
+    if (isMainlyClear || isClear) return _WeatherGlyphKind.clearNight;
+    return _WeatherGlyphKind.clearNight;
   }
 
-  return isDaylight == false
-      ? _moonStarGlyph(size: size)
-      : Text('🌤️', style: TextStyle(fontSize: size));
+  if (isPartlyCloudy) return _WeatherGlyphKind.partlyCloudyDay;
+  if (isMainlyClear || isClear) return _WeatherGlyphKind.clearDay;
+  return _WeatherGlyphKind.partlyCloudyDay;
+}
+
+int _moonPhaseIndex(dynamic timeValue) {
+  final when = _parseWeatherDateTime(timeValue) ?? DateTime.now().toUtc();
+  const synodicMonthDays = 29.53058867;
+  final referenceNewMoon = DateTime.utc(2000, 1, 6, 18, 14);
+  final daysSinceReference =
+      when.toUtc().difference(referenceNewMoon).inSeconds / 86400.0;
+
+  var cycleDays = daysSinceReference % synodicMonthDays;
+  if (cycleDays < 0) cycleDays += synodicMonthDays;
+
+  final phase = cycleDays / synodicMonthDays;
+  return ((phase * 8).round()) % 8;
+}
+
+DateTime? _parseWeatherDateTime(dynamic value) {
+  if (value == null) return null;
+  if (value is DateTime) return value;
+
+  final raw = '$value'.trim();
+  if (raw.isEmpty || raw == 'null') return null;
+
+  final parsed = DateTime.tryParse(raw);
+  if (parsed != null) return parsed;
+
+  if (RegExp(r'^\d{4}-\d{2}-\d{2}$').hasMatch(raw)) {
+    return DateTime.tryParse('${raw}T12:00:00Z');
+  }
+
+  return null;
+}
+
+const Map<_WeatherGlyphKind, String> _weatherGlyphAssetPaths = {
+  _WeatherGlyphKind.thunder: 'assets/glyphs/thunder.png',
+  _WeatherGlyphKind.snow: 'assets/glyphs/snow.png',
+  _WeatherGlyphKind.rain: 'assets/glyphs/rain.png',
+  _WeatherGlyphKind.fog: 'assets/glyphs/fog.png',
+  _WeatherGlyphKind.overcast: 'assets/glyphs/overcast.png',
+  _WeatherGlyphKind.partlyCloudyDay: 'assets/glyphs/partly_cloudy_day.png',
+  _WeatherGlyphKind.clearDay: 'assets/glyphs/clear_day.png',
+};
+
+Widget _buildWeatherGlyph({
+  required _WeatherGlyphKind kind,
+  required double size,
+  dynamic timeValue,
+}) {
+  final phaseIndex = _moonPhaseIndex(timeValue);
+  final assetPath = switch (kind) {
+    _WeatherGlyphKind.clearNight => 'assets/glyphs/clear_night_$phaseIndex.png',
+    _WeatherGlyphKind.partlyCloudyNight =>
+      'assets/glyphs/partly_cloudy_night_$phaseIndex.png',
+    _ => _weatherGlyphAssetPaths[kind],
+  };
+
+  if (assetPath == null) {
+    return _buildWeatherGlyphFallback(kind: kind, size: size);
+  }
+
+  return Image.asset(
+    assetPath,
+    width: size,
+    height: size,
+    fit: BoxFit.contain,
+    filterQuality: FilterQuality.high,
+    errorBuilder: (context, error, stackTrace) {
+      return _buildWeatherGlyphFallback(kind: kind, size: size);
+    },
+  );
+}
+
+Widget _buildWeatherGlyphFallback({
+  required _WeatherGlyphKind kind,
+  required double size,
+}) {
+  switch (kind) {
+    case _WeatherGlyphKind.thunder:
+      return _detailedIcon(
+        icon: Icons.thunderstorm_rounded,
+        size: size,
+        baseColor: const Color(0xFFFFD76A),
+        highlightColor: const Color(0xFFFFF2BE),
+      );
+    case _WeatherGlyphKind.snow:
+      return _detailedIcon(
+        icon: Icons.ac_unit_rounded,
+        size: size,
+        baseColor: const Color(0xFFD4EDFF),
+        highlightColor: Colors.white,
+      );
+    case _WeatherGlyphKind.rain:
+      return _detailedIcon(
+        icon: Icons.grain_rounded,
+        size: size,
+        baseColor: const Color(0xFFA7DAFF),
+        highlightColor: const Color(0xFFE6F6FF),
+      );
+    case _WeatherGlyphKind.fog:
+      return _wispyFogGlyph(size: size);
+    case _WeatherGlyphKind.overcast:
+      return _detailedIcon(
+        icon: Icons.cloud_rounded,
+        size: size,
+        baseColor: const Color(0xFFDCE7FF),
+        highlightColor: const Color(0xFFFFFFFF),
+      );
+    case _WeatherGlyphKind.partlyCloudyDay:
+      return _sunCloudGlyph(size: size);
+    case _WeatherGlyphKind.partlyCloudyNight:
+      return _cloudMoonGlyph(size: size);
+    case _WeatherGlyphKind.clearDay:
+      return _detailedIcon(
+        icon: Icons.wb_sunny_rounded,
+        size: size,
+        baseColor: const Color(0xFFFFD76A),
+        highlightColor: const Color(0xFFFFF0B2),
+      );
+    case _WeatherGlyphKind.clearNight:
+      return _moonStarGlyph(size: size);
+  }
+}
+
+Widget _detailedIcon({
+  required IconData icon,
+  required double size,
+  required Color baseColor,
+  required Color highlightColor,
+}) {
+  return SizedBox(
+    width: size,
+    height: size,
+    child: Stack(
+      clipBehavior: Clip.none,
+      children: [
+        Positioned(
+          left: size * 0.04,
+          top: size * 0.06,
+          child: Icon(
+            icon,
+            size: size,
+            color: Colors.black.withValues(alpha: 0.35),
+          ),
+        ),
+        Icon(icon, size: size, color: baseColor),
+        Positioned(
+          left: size * 0.015,
+          top: -size * 0.02,
+          child: Icon(
+            icon,
+            size: size * 0.9,
+            color: highlightColor.withValues(alpha: 0.55),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+Widget _wispyFogGlyph({required double size}) {
+  Widget fogBand(double widthFactor, double top, double opacity) {
+    return Positioned(
+      top: top,
+      left: size * ((1.45 - widthFactor) / 2),
+      child: Container(
+        width: size * widthFactor,
+        height: size * 0.11,
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            colors: [
+              const Color(0xFFE3EEFF).withValues(alpha: opacity),
+              Colors.white.withValues(alpha: opacity * 0.9),
+            ],
+          ),
+          borderRadius: BorderRadius.circular(size),
+        ),
+      ),
+    );
+  }
+
+  return SizedBox(
+    width: size * 1.45,
+    height: size * 1.22,
+    child: Stack(
+      clipBehavior: Clip.none,
+      children: [
+        Positioned(
+          top: -size * 0.02,
+          left: size * 0.23,
+          child: _detailedIcon(
+            icon: Icons.cloud_rounded,
+            size: size * 0.9,
+            baseColor: const Color(0xFFDCE7FF),
+            highlightColor: Colors.white,
+          ),
+        ),
+        fogBand(1.35, size * 0.57, 0.88),
+        fogBand(1.05, size * 0.74, 0.75),
+        fogBand(1.2, size * 0.91, 0.62),
+      ],
+    ),
+  );
+}
+
+Widget _sunCloudGlyph({required double size}) {
+  return SizedBox(
+    width: size * 1.15,
+    height: size,
+    child: Stack(
+      clipBehavior: Clip.none,
+      children: [
+        Positioned(
+          left: size * 0.2,
+          top: 0,
+          child: _detailedIcon(
+            icon: Icons.wb_sunny_rounded,
+            size: size * 0.74,
+            baseColor: const Color(0xFFFFD76A),
+            highlightColor: const Color(0xFFFFF1BA),
+          ),
+        ),
+        Positioned(
+          left: 0,
+          top: size * 0.2,
+          child: _detailedIcon(
+            icon: Icons.cloud_rounded,
+            size: size,
+            baseColor: const Color(0xFFDCE7FF),
+            highlightColor: Colors.white,
+          ),
+        ),
+      ],
+    ),
+  );
 }
 
 Widget _moonStarGlyph({required double size}) {
   return SizedBox(
-    width: size * 1.05,
-    height: size * 1.0,
+    width: size * 1.15,
+    height: size,
     child: Stack(
       clipBehavior: Clip.none,
       children: [
         Positioned(
           left: 0,
           top: 0,
-          child: Text('🌙', style: TextStyle(fontSize: size)),
+          child: _detailedIcon(
+            icon: Icons.nightlight_round,
+            size: size,
+            baseColor: const Color(0xFFD5DEFF),
+            highlightColor: const Color(0xFFF4F7FF),
+          ),
         ),
         Positioned(
-          left: size * 0.34,
-          top: size * 0.09,
-          child: Text(
-            '✦',
-            style: TextStyle(
-              fontSize: size * 0.34,
-              color: Colors.white,
-              fontWeight: FontWeight.w700,
-            ),
+          left: size * 0.35,
+          top: size * 0.08,
+          child: _detailedIcon(
+            icon: Icons.star_rounded,
+            size: size * 0.28,
+            baseColor: const Color(0xFFFFE69A),
+            highlightColor: const Color(0xFFFFF3CB),
+          ),
+        ),
+        Positioned(
+          left: size * 0.22,
+          top: -size * 0.01,
+          child: _detailedIcon(
+            icon: Icons.star_rounded,
+            size: size * 0.14,
+            baseColor: const Color(0xFFFFE69A),
+            highlightColor: const Color(0xFFFFF3CB),
+          ),
+        ),
+        Positioned(
+          left: size * 0.52,
+          top: size * 0.4,
+          child: _detailedIcon(
+            icon: Icons.star_rounded,
+            size: size * 0.18,
+            baseColor: const Color(0xFFFFE69A),
+            highlightColor: const Color(0xFFFFF3CB),
           ),
         ),
       ],
@@ -1443,7 +2305,7 @@ Widget _moonStarGlyph({required double size}) {
 Widget _cloudMoonGlyph({required double size}) {
   return SizedBox(
     width: size * 1.2,
-    height: size * 1.0,
+    height: size,
     child: Stack(
       clipBehavior: Clip.none,
       children: [
@@ -1455,7 +2317,12 @@ Widget _cloudMoonGlyph({required double size}) {
         Positioned(
           left: 0,
           top: size * 0.2,
-          child: Text('☁️', style: TextStyle(fontSize: size)),
+          child: _detailedIcon(
+            icon: Icons.cloud_rounded,
+            size: size,
+            baseColor: const Color(0xFFDCE7FF),
+            highlightColor: Colors.white,
+          ),
         ),
       ],
     ),

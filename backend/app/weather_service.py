@@ -185,6 +185,10 @@ def fetch_open_meteo_forecast(request: ForecastRequest) -> dict:
             [
                 "temperature_2m",
                 "apparent_temperature",
+                "relative_humidity_2m",
+                "wind_speed_10m",
+                "wind_direction_10m",
+                "uv_index",
                 "precipitation_probability",
                 "precipitation",
                 "weather_code",
@@ -421,8 +425,20 @@ def normalize_forecast_response(data: dict, location: dict) -> dict:
                 "apparent_temperature": hourly.get(
                     "apparent_temperature", [None] * len(times)
                 )[i],
+                "humidity": hourly.get("relative_humidity_2m", [None] * len(times))[i],
+                "wind_speed": hourly.get("wind_speed_10m", [None] * len(times))[i],
+                "wind_direction_degrees": hourly.get(
+                    "wind_direction_10m", [None] * len(times)
+                )[i],
+                "wind_direction_compass": wind_direction_to_compass(
+                    hourly.get("wind_direction_10m", [None] * len(times))[i]
+                ),
+                "uv_index": hourly.get("uv_index", [None] * len(times))[i],
                 "precipitation_probability": hourly.get(
                     "precipitation_probability", [None] * len(times)
+                )[i],
+                "precipitation_amount_mm": hourly.get(
+                    "precipitation", [None] * len(times)
                 )[i],
                 "is_daylight": _is_daylight_at(
                     time_iso,

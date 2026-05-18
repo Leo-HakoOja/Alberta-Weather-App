@@ -10,6 +10,7 @@ Cross-platform weather product (iPhone + Android) with a clean, ad-free UI.
 - `scripts/` – helper launch scripts
 - `docs/` – planning, architecture, milestones
 - `tests/` – automated tests
+- `docs/ios-release-checklist.md` – iOS/TestFlight/App Store launch checklist
 
 ## Current Status
 
@@ -31,11 +32,17 @@ bash ~/weather-app/scripts/run-weather.sh [mode]
 ```
 
 Modes:
+
 - `full` (default): backend + Flutter desktop app
 - `preview`: backend + Flutter web preview (best for iPhone/Android-sized simulation)
 - `iphone`: one-command iPhone preview (backend + release web build + LAN web server)
 - `cli`: terminal weather app only
 - `api`: backend API only
+
+## iOS Release
+
+- Checklist: `docs/ios-release-checklist.md`
+- Build helper (run on macOS): `scripts/build-ios-release.sh`
 
 Examples:
 
@@ -57,5 +64,6 @@ pip install -r backend/requirements.txt
 ```
 
 Then open:
+
 - API docs: `http://localhost:8000/docs`
 - Myrnam endpoint: `http://localhost:8000/v1/weather/myrnam`

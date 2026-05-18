@@ -39,7 +39,13 @@ class HourlyForecastItem(BaseModel):
     weather: str
     temperature: float | None
     apparent_temperature: float | None
+    humidity: float | int | None = None
+    wind_speed: float | None = None
+    wind_direction_degrees: float | int | None = None
+    wind_direction_compass: str = "N/A"
+    uv_index: float | None = None
     precipitation_probability: float | int | None
+    precipitation_amount_mm: float | None = None
     is_daylight: bool | None = None
 
 
