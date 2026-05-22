@@ -19,3 +19,20 @@ venv/
 .DS_Store
 .vscode/
 .idea/
+
+# Keys, certs, credentials
+*.key
+*.pem
+*.p12
+*.p8
+*.pfx
+*.cer
+*-credentials.json
+*-service-account.json
+service-account.json
+google-services.json
+GoogleService-Info.plist
+
+# Backend cache and state
+backend/.cache/
+backend/.pi-lens/
