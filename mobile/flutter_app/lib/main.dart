@@ -558,7 +558,7 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
               RefreshIndicator(
                 onRefresh: _refresh,
                 child: ListView(
-                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+                  padding: EdgeInsets.fromLTRB(16, 12 + MediaQuery.of(context).padding.top, 16, 24),
                   children: [
                     _LocationPickerButton(
                       selected: _selectedLocation,
@@ -1438,8 +1438,8 @@ class _MetricsGrid extends StatelessWidget {
       gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
         crossAxisCount: 4,
         crossAxisSpacing: 8,
-        mainAxisSpacing: 0,
-        childAspectRatio: 1.15,
+        mainAxisSpacing: 8,
+        childAspectRatio: 1.4,
       ),
       itemBuilder: (context, index) {
         return _MetricCard(label: metrics[index].$1, value: metrics[index].$2);
@@ -1458,9 +1458,10 @@ class _MetricCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return Card(
       elevation: 0,
+      margin: EdgeInsets.zero,
       color: _albertaBlue,
       child: Padding(
-        padding: const EdgeInsets.all(8),
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisAlignment: MainAxisAlignment.center,
