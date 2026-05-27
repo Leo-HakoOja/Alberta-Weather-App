@@ -69,7 +69,5 @@ workflows:
       app_store_connect:
         auth: integration
         submit_to_testflight: true
-        beta_groups:
-          - Internal Testers
         expire_build_submitted_for_review: true
 
