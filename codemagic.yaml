@@ -3,13 +3,6 @@ workflows:
     name: iOS TestFlight (Flutter)
     max_build_duration: 60
 
-    triggering:
-      events:
-        - push
-      branch_patterns:
-        - pattern: main
-          include: true
-
     integrations:
       app_store_connect: WeatherAppASC
 
