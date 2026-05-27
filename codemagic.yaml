@@ -34,9 +34,7 @@ workflows:
 
       - name: Install CocoaPods
         script: |
-          cd "$FLUTTER_PROJECT_DIR"
-          flutter build ios --config-only
-          cd ios
+          cd "$FLUTTER_PROJECT_DIR/ios"
           pod install
 
       - name: Set up keychain and fetch signing files
