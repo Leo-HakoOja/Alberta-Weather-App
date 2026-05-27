@@ -75,9 +75,3 @@ workflows:
           - Internal Testers
         expire_build_submitted_for_review: true
 
-      email:
-        recipients:
-          - $NOTIFY_EMAIL
-        notify:
-          success: true
-          failure: true
