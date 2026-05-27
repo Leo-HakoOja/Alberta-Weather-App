@@ -68,7 +68,7 @@ workflows:
 
       email:
         recipients:
-          - REDACTED
+          - leohakooja@gmail.com
         notify:
           success: true
           failure: true
