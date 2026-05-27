@@ -75,7 +75,7 @@ workflows:
 
       email:
         recipients:
-          - leohakooja@gmail.com
+          - $NOTIFY_EMAIL
         notify:
           success: true
           failure: true
