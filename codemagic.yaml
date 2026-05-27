@@ -9,7 +9,6 @@ workflows:
       branch_patterns:
         - pattern: main
           include: true
-          source: true
 
     integrations:
       app_store_connect: WeatherAppASC
