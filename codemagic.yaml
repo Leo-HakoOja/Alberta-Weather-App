@@ -20,7 +20,6 @@ workflows:
       vars:
         FLUTTER_PROJECT_DIR: mobile/flutter_app
         WEATHER_API_URL: https://alberta-weather-api.fly.dev/v1/weather/myrnam
-        CERT_PRIVATE_KEY: $CERT_PRIVATE_KEY
 
     scripts:
       - name: Validate Flutter project
