@@ -1434,12 +1434,13 @@ class _MetricsGrid extends StatelessWidget {
     return GridView.builder(
       shrinkWrap: true,
       physics: const NeverScrollableScrollPhysics(),
+      padding: EdgeInsets.zero,
       itemCount: metrics.length,
       gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
         crossAxisCount: 4,
         crossAxisSpacing: 8,
         mainAxisSpacing: 8,
-        childAspectRatio: 1.4,
+        mainAxisExtent: 68,
       ),
       itemBuilder: (context, index) {
         return _MetricCard(label: metrics[index].$1, value: metrics[index].$2);
