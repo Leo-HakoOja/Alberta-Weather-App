@@ -19,9 +19,6 @@ workflows:
       cocoapods: default
       groups:
         - Notifications
-      ios_signing:
-        distribution_type: app_store
-        bundle_identifier: ca.hakooja.albertaweather
       vars:
         FLUTTER_PROJECT_DIR: mobile/flutter_app
         WEATHER_API_URL: https://alberta-weather-api.fly.dev/v1/weather/myrnam
@@ -42,8 +39,18 @@ workflows:
           cd "$FLUTTER_PROJECT_DIR/ios"
           pod install
 
-      - name: Set up code signing
+      - name: Set up keychain and fetch signing files
         script: |
+          keychain initialize
+          app-store-connect fetch-signing-files ca.hakooja.albertaweather \
+            --type IOS_APP_STORE \
+            --certificate-key=@env:CERT_PRIVATE_KEY \
+            --create
+          keychain add-certificates
+
+      - name: Configure code signing
+        script: |
+          cd "$FLUTTER_PROJECT_DIR/ios"
           xcode-project use-profiles
 
       - name: Build iOS IPA
