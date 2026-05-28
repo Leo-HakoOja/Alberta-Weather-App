@@ -1170,8 +1170,8 @@ class _RadarPreviewCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return GestureDetector(
       onTap: onTap,
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(16),
+      child: ClipPath(
+        clipper: const _AlbertaClipper(),
         child: Stack(
           fit: StackFit.expand,
           children: [
@@ -1247,6 +1247,39 @@ class _RadarPreviewCard extends StatelessWidget {
       ),
     );
   }
+}
+
+class _AlbertaClipper extends CustomClipper<Path> {
+  const _AlbertaClipper();
+
+  @override
+  Path getClip(Size size) {
+    // Alberta: ~660 km wide, ~1220 km tall (ratio 0.541).
+    // NE corner (60°N / 110°W) anchors to the card's top-right.
+    // Western border (120°W) is inset from the left proportionally.
+    final provinceWidth = size.height * 0.541;
+    final left = size.width - provinceWidth;
+
+    // rOuter matches the existing card border radius so top/right feel unchanged.
+    // rInner softens the visible Alberta corners (NW and SW).
+    const rOuter = 16.0;
+    const rInner = 8.0;
+
+    return Path()
+      ..moveTo(left + rInner, 0)
+      ..lineTo(size.width - rOuter, 0)
+      ..arcToPoint(Offset(size.width, rOuter), radius: const Radius.circular(rOuter))
+      ..lineTo(size.width, size.height - rOuter)
+      ..arcToPoint(Offset(size.width - rOuter, size.height), radius: const Radius.circular(rOuter))
+      ..lineTo(left + rInner, size.height)
+      ..arcToPoint(Offset(left, size.height - rInner), radius: const Radius.circular(rInner))
+      ..lineTo(left, rInner)
+      ..arcToPoint(Offset(left + rInner, 0), radius: const Radius.circular(rInner))
+      ..close();
+  }
+
+  @override
+  bool shouldReclip(_AlbertaClipper old) => false;
 }
 
 class _RadarViewerSheet extends StatefulWidget {
