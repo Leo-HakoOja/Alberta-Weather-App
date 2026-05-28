@@ -17,6 +17,8 @@ workflows:
       flutter: stable
       xcode: latest
       cocoapods: default
+      groups:
+        - notifications
       vars:
         FLUTTER_PROJECT_DIR: mobile/flutter_app
         WEATHER_API_URL: https://alberta-weather-api.fly.dev/v1/weather/myrnam
@@ -40,7 +42,15 @@ workflows:
       - name: Set up keychain and fetch signing files
         script: |
           keychain initialize
-          echo "$CERT_PRIVATE_KEY" | base64 --decode > /tmp/ios_distribution_key.pem
+          if [ -z "$CERT_PRIVATE_KEY" ]; then
+            echo "CERT_PRIVATE_KEY secret is empty or not set in Codemagic environment variables"
+            exit 1
+          fi
+          echo "$CERT_PRIVATE_KEY" | base64 -D > /tmp/ios_distribution_key.pem
+          if [ ! -s /tmp/ios_distribution_key.pem ]; then
+            echo "PEM file is empty after decode — CERT_PRIVATE_KEY may not be valid base64"
+            exit 1
+          fi
           app-store-connect fetch-signing-files ca.hakooja.albertaweather \
             --type IOS_APP_STORE \
             --certificate-key=@file:/tmp/ios_distribution_key.pem \
