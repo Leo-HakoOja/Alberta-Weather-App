@@ -17,6 +17,8 @@ workflows:
       flutter: stable
       xcode: latest
       cocoapods: default
+      groups:
+        - Notifications
       vars:
         FLUTTER_PROJECT_DIR: mobile/flutter_app
         WEATHER_API_URL: https://alberta-weather-api.fly.dev/v1/weather/myrnam
