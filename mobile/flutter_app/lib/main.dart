@@ -15,7 +15,7 @@ class _RadarFrame {
   final int unixTime;
 
   String tileUrlTemplate() {
-    return 'https://tilecache.rainviewer.com$path/256/{z}/{x}/{y}/2/1_1.png';
+    return 'https://tilecache.rainviewer.com$path/256/{z}/{x}/{y}/6/1_1.png';
   }
 }
 
@@ -979,8 +979,9 @@ class _HeroCurrentCard extends StatelessWidget {
       ),
       child: Padding(
         padding: const EdgeInsets.all(18),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
+        child: IntrinsicHeight(
+          child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Expanded(
               child: Column(
@@ -1036,10 +1037,6 @@ class _HeroCurrentCard extends StatelessWidget {
                       color: Colors.white,
                     ),
                   ),
-                  if (sources.length >= 2) ...[
-                    const SizedBox(height: 8),
-                    _SourceComparisonStrip(sources: sources),
-                  ],
                   const SizedBox(height: 2),
                   Text(
                     weather,
@@ -1056,10 +1053,13 @@ class _HeroCurrentCard extends StatelessWidget {
                   ),
                   const SizedBox(height: 2),
                   Text(
-                    'Sunrise ${_fmtClockFromIso(current['sunrise'])}   Sunset ${_fmtClockFromIso(current['sunset'])}',
-                    maxLines: 1,
-                    softWrap: false,
-                    overflow: TextOverflow.fade,
+                    'Sunrise ${_fmtClockFromIso(current['sunrise'])}',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: Colors.white70,
+                    ),
+                  ),
+                  Text(
+                    'Sunset ${_fmtClockFromIso(current['sunset'])}',
                     style: theme.textTheme.bodySmall?.copyWith(
                       color: Colors.white70,
                     ),
@@ -1068,16 +1068,25 @@ class _HeroCurrentCard extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 12),
-            SizedBox(
-              width: 132,
-              height: 160,
-              child: _RadarPreviewCard(
-                timelineFuture: radarFuture,
-                location: selectedLocation,
-                onTap: onRadarTap,
+            AspectRatio(
+              aspectRatio: 110 / 203,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  ClipPath(
+                    clipper: const _AlbertaShapeClipper(),
+                    child: _RadarPreviewCard(
+                      timelineFuture: radarFuture,
+                      location: selectedLocation,
+                      onTap: onRadarTap,
+                    ),
+                  ),
+                  CustomPaint(painter: const _AlbertaBorderPainter()),
+                ],
               ),
             ),
           ],
+        ),
         ),
       ),
     );
@@ -1171,116 +1180,177 @@ class _RadarPreviewCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return GestureDetector(
       onTap: onTap,
-      child: ClipPath(
-        clipper: const _AlbertaClipper(),
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            FutureBuilder<_RadarTimeline>(
-              future: timelineFuture,
-              builder: (context, snapshot) {
-                if (!snapshot.hasData || snapshot.data!.latestOrNull == null) {
-                  return Container(
-                    color: Colors.black.withValues(alpha: 0.25),
-                    alignment: Alignment.center,
-                    child: const Icon(Icons.radar, color: Colors.white70),
-                  );
-                }
-                return FlutterMap(
-                  options: MapOptions(
-                    initialCenter: LatLng(
-                      location.latitude,
-                      location.longitude,
-                    ),
-                    initialZoom: 6,
-                    interactionOptions: const InteractionOptions(
-                      flags: InteractiveFlag.none,
-                    ),
-                  ),
-                  children: [
-                    TileLayer(
-                      urlTemplate:
-                          'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                      userAgentPackageName: 'ca.alberta.weather',
-                    ),
-                    TileLayer(
-                      urlTemplate: snapshot.data!.latestOrNull!
-                          .tileUrlTemplate(),
-                    ),
-                  ],
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          FutureBuilder<_RadarTimeline>(
+            future: timelineFuture,
+            builder: (context, snapshot) {
+              if (!snapshot.hasData || snapshot.data!.latestOrNull == null) {
+                return Container(
+                  color: Colors.black.withValues(alpha: 0.25),
+                  alignment: Alignment.center,
+                  child: const Icon(Icons.radar, color: Colors.white70, size: 36),
                 );
-              },
-            ),
-            DecoratedBox(
-              decoration: BoxDecoration(
-                gradient: RadialGradient(
-                  center: Alignment.center,
-                  radius: 1.0,
-                  colors: [
-                    Colors.transparent,
-                    Colors.black.withValues(alpha: 0.44),
-                  ],
-                  stops: const [0.55, 1],
-                ),
-              ),
-            ),
-            Positioned(
-              right: 8,
-              bottom: 8,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
-                decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.4),
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: const Text(
-                  'Radar',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w600,
+              }
+              return FlutterMap(
+                options: MapOptions(
+                  initialCameraFit: CameraFit.bounds(
+                    bounds: LatLngBounds(
+                      const LatLng(48.9, -120.1),
+                      const LatLng(60.1, -109.9),
+                    ),
+                    padding: const EdgeInsets.all(4),
+                  ),
+                  interactionOptions: const InteractionOptions(
+                    flags: InteractiveFlag.none,
                   ),
                 ),
+                children: [
+                  TileLayer(
+                    urlTemplate:
+                        'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+                    userAgentPackageName: 'ca.alberta.weather',
+                  ),
+                  TileLayer(
+                    urlTemplate: snapshot.data!.latestOrNull!.tileUrlTemplate(),
+                    maxNativeZoom: 9,
+                  ),
+                ],
+              );
+            },
+          ),
+          DecoratedBox(
+            decoration: BoxDecoration(
+              gradient: RadialGradient(
+                center: Alignment.center,
+                radius: 1.0,
+                colors: [
+                  Colors.transparent,
+                  Colors.black.withValues(alpha: 0.38),
+                ],
+                stops: const [0.6, 1],
               ),
             ),
-          ],
-        ),
+          ),
+          Positioned(
+            right: 10,
+            bottom: 10,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: 0.45),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: const Text(
+                'Radar',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
 }
 
-class _AlbertaClipper extends CustomClipper<ui.Path> {
-  const _AlbertaClipper();
+// 49-point simplified Alberta border derived from Natural Earth 1:10m data
+// (Ramer-Douglas-Peucker ε=0.05°). Normalised to bounding box
+// [48.993–60.0°N, 120.001–109.999°W]: x=0→120°W, x=1→110°W, y=0→60°N, y=1→49°N.
+const List<Offset> _kAlbertaNorm = [
+  Offset(1.0,    1.0),
+  Offset(0.5936, 1.0),
+  Offset(0.5846, 0.9859),
+  Offset(0.5624, 0.9807),
+  Offset(0.5422, 0.9635),
+  Offset(0.5424, 0.9488),
+  Offset(0.5256, 0.9459),
+  Offset(0.5375, 0.9284),
+  Offset(0.5339, 0.9026),
+  Offset(0.5225, 0.8763),
+  Offset(0.5,    0.8573),
+  Offset(0.478,  0.8585),
+  Offset(0.4665, 0.8426),
+  Offset(0.4354, 0.8311),
+  Offset(0.4428, 0.8267),
+  Offset(0.438,  0.8203),
+  Offset(0.3743, 0.7891),
+  Offset(0.3705, 0.7767),
+  Offset(0.3424, 0.7591),
+  Offset(0.3329, 0.7444),
+  Offset(0.3063, 0.7522),
+  Offset(0.2682, 0.7102),
+  Offset(0.241,  0.7149),
+  Offset(0.2247, 0.7086),
+  Offset(0.2179, 0.7014),
+  Offset(0.2264, 0.6912),
+  Offset(0.2009, 0.6828),
+  Offset(0.1774, 0.6931),
+  Offset(0.1793, 0.683),
+  Offset(0.1653, 0.6708),
+  Offset(0.1695, 0.6652),
+  Offset(0.158,  0.6504),
+  Offset(0.1377, 0.6462),
+  Offset(0.1329, 0.6328),
+  Offset(0.1224, 0.6311),
+  Offset(0.1249, 0.6255),
+  Offset(0.1151, 0.6193),
+  Offset(0.1004, 0.6144),
+  Offset(0.0972, 0.6237),
+  Offset(0.0738, 0.6179),
+  Offset(0.0608, 0.6028),
+  Offset(0.0359, 0.6038),
+  Offset(0.0096, 0.5885),
+  Offset(0.0074, 0.5801),
+  Offset(0.0268, 0.5793),
+  Offset(0.0,    0.5612),
+  Offset(0.0001, 0.0),
+  Offset(0.9999, 0.0),
+  Offset(1.0,    1.0),
+];
 
-  @override
-  ui.Path getClip(Size size) {
-    // Alberta: ~660 km wide, ~1220 km tall (ratio 0.541).
-    // NE corner (60°N / 110°W) anchors to the card's top-right.
-    // Western border (120°W) is inset from the left proportionally.
-    final provinceWidth = size.height * 0.541;
-    final left = size.width - provinceWidth;
+class _AlbertaShapeClipper extends CustomClipper<ui.Path> {
+  const _AlbertaShapeClipper();
 
-    // rOuter matches the existing card border radius so top/right feel unchanged.
-    // rInner softens the visible Alberta corners (NW and SW).
-    const rOuter = 16.0;
-    const rInner = 8.0;
-
-    return ui.Path()
-      ..moveTo(left + rInner, 0)
-      ..lineTo(size.width - rOuter, 0)
-      ..arcToPoint(Offset(size.width, rOuter), radius: const Radius.circular(rOuter))
-      ..lineTo(size.width, size.height - rOuter)
-      ..arcToPoint(Offset(size.width - rOuter, size.height), radius: const Radius.circular(rOuter))
-      ..lineTo(left + rInner, size.height)
-      ..arcToPoint(Offset(left, size.height - rInner), radius: const Radius.circular(rInner))
-      ..lineTo(left, rInner)
-      ..arcToPoint(Offset(left + rInner, 0), radius: const Radius.circular(rInner))
-      ..close();
+  static ui.Path _build(Size s) {
+    final path = ui.Path();
+    for (var i = 0; i < _kAlbertaNorm.length; i++) {
+      final pt = _kAlbertaNorm[i];
+      final x = pt.dx * s.width;
+      final y = pt.dy * s.height;
+      i == 0 ? path.moveTo(x, y) : path.lineTo(x, y);
+    }
+    return path..close();
   }
 
   @override
-  bool shouldReclip(_AlbertaClipper old) => false;
+  ui.Path getClip(Size size) => _build(size);
+
+  @override
+  bool shouldReclip(_AlbertaShapeClipper old) => false;
+}
+
+class _AlbertaBorderPainter extends CustomPainter {
+  const _AlbertaBorderPainter();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.drawPath(
+      _AlbertaShapeClipper._build(size),
+      ui.Paint()
+        ..color = _albertaGold.withValues(alpha: 0.75)
+        ..style = ui.PaintingStyle.stroke
+        ..strokeWidth = 1.5
+        ..strokeJoin = ui.StrokeJoin.miter,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_AlbertaBorderPainter old) => false;
 }
 
 class _RadarViewerSheet extends StatefulWidget {
@@ -1392,19 +1462,25 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
               Expanded(
                 child: FlutterMap(
                   options: MapOptions(
-                    initialCenter: LatLng(
-                      widget.location.latitude,
-                      widget.location.longitude,
+                    initialCameraFit: CameraFit.bounds(
+                      bounds: LatLngBounds(
+                        const LatLng(48.9, -120.1),
+                        const LatLng(60.1, -109.9),
+                      ),
+                      padding: const EdgeInsets.all(16),
                     ),
-                    initialZoom: 6,
+                    minZoom: 4,
                   ),
                   children: [
                     TileLayer(
                       urlTemplate:
-                          'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                          'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
                       userAgentPackageName: 'ca.alberta.weather',
                     ),
-                    TileLayer(urlTemplate: frame.tileUrlTemplate()),
+                    TileLayer(
+                      urlTemplate: frame.tileUrlTemplate(),
+                      maxNativeZoom: 9,
+                    ),
                   ],
                 ),
               ),
