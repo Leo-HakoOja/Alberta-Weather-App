@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
@@ -1249,11 +1250,11 @@ class _RadarPreviewCard extends StatelessWidget {
   }
 }
 
-class _AlbertaClipper extends CustomClipper<Path> {
+class _AlbertaClipper extends CustomClipper<ui.Path> {
   const _AlbertaClipper();
 
   @override
-  Path getClip(Size size) {
+  ui.Path getClip(Size size) {
     // Alberta: ~660 km wide, ~1220 km tall (ratio 0.541).
     // NE corner (60°N / 110°W) anchors to the card's top-right.
     // Western border (120°W) is inset from the left proportionally.
@@ -1265,7 +1266,7 @@ class _AlbertaClipper extends CustomClipper<Path> {
     const rOuter = 16.0;
     const rInner = 8.0;
 
-    return Path()
+    return ui.Path()
       ..moveTo(left + rInner, 0)
       ..lineTo(size.width - rOuter, 0)
       ..arcToPoint(Offset(size.width, rOuter), radius: const Radius.circular(rOuter))
