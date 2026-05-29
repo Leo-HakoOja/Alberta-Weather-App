@@ -1574,6 +1574,10 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
   Timer? _timer;
   int _frameIndex = 0;
   bool _playing = false;
+  int _windowMinutes = 120;
+  // Number of frames in the currently selected loop window; kept in sync by
+  // build() and read by the playback timer.
+  int _loopFrameCount = 1;
 
   @override
   void initState() {
@@ -1581,7 +1585,7 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
     // Auto-play the loop as soon as the frames are ready.
     widget.timelineFuture.then((timeline) {
       if (mounted && timeline.frames.length > 1) {
-        _startPlaying(timeline.frames.length);
+        _startPlaying();
       }
     });
   }
@@ -1592,12 +1596,16 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
     super.dispose();
   }
 
-  void _startPlaying(int max) {
+  void _startPlaying() {
     _timer?.cancel();
     setState(() => _playing = true);
     _timer = Timer.periodic(const Duration(milliseconds: 800), (_) {
       if (!mounted) return;
-      setState(() => _frameIndex = (_frameIndex + 1) % max);
+      setState(() {
+        _frameIndex = _loopFrameCount > 0
+            ? (_frameIndex + 1) % _loopFrameCount
+            : 0;
+      });
     });
   }
 
@@ -1606,12 +1614,19 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
     setState(() => _playing = false);
   }
 
-  void _togglePlay(int max) {
+  void _togglePlay() {
     if (_playing) {
       _stopPlaying();
     } else {
-      _startPlaying(max);
+      _startPlaying();
     }
+  }
+
+  void _setWindow(int minutes) {
+    setState(() {
+      _windowMinutes = minutes;
+      _frameIndex = 0;
+    });
   }
 
   @override
@@ -1628,8 +1643,8 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
             return const Center(child: CircularProgressIndicator());
           }
 
-          final frames = snapshot.data!.frames;
-          if (frames.isEmpty) {
+          final allFrames = snapshot.data!.frames;
+          if (allFrames.isEmpty) {
             return const Center(
               child: Text(
                 'Radar temporarily unavailable.',
@@ -1637,6 +1652,13 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
               ),
             );
           }
+          // Trim to the selected loop window (most recent N minutes of radar).
+          final cutoff = allFrames.last.unixTime - _windowMinutes * 60;
+          var frames = allFrames.where((f) => f.unixTime >= cutoff).toList();
+          if (frames.length < 2) {
+            frames = allFrames;
+          }
+          _loopFrameCount = frames.length;
           if (_frameIndex >= frames.length) {
             _frameIndex = frames.length - 1;
           }
@@ -1729,7 +1751,7 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
                 child: Row(
                   children: [
                     IconButton(
-                      onPressed: () => _togglePlay(frames.length),
+                      onPressed: _togglePlay,
                       icon: Icon(
                         _playing ? Icons.pause_circle : Icons.play_circle,
                         color: Colors.white,
@@ -1750,6 +1772,37 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
                             _frameIndex = value.round();
                           });
                         },
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    PopupMenuButton<int>(
+                      initialValue: _windowMinutes,
+                      onSelected: _setWindow,
+                      tooltip: 'Loop length',
+                      itemBuilder: (_) => const [
+                        PopupMenuItem(value: 30, child: Text('Last 30 min')),
+                        PopupMenuItem(value: 60, child: Text('Last hour')),
+                        PopupMenuItem(value: 120, child: Text('Last 2 hours')),
+                      ],
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            _windowMinutes == 30
+                                ? '30 min'
+                                : _windowMinutes == 60
+                                ? '1 h'
+                                : '2 h',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          const Icon(
+                            Icons.arrow_drop_down,
+                            color: Colors.white,
+                          ),
+                        ],
                       ),
                     ),
                   ],
