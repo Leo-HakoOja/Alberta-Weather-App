@@ -1576,25 +1576,42 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
   bool _playing = false;
 
   @override
+  void initState() {
+    super.initState();
+    // Auto-play the loop as soon as the frames are ready.
+    widget.timelineFuture.then((timeline) {
+      if (mounted && timeline.frames.length > 1) {
+        _startPlaying(timeline.frames.length);
+      }
+    });
+  }
+
+  @override
   void dispose() {
     _timer?.cancel();
     super.dispose();
   }
 
+  void _startPlaying(int max) {
+    _timer?.cancel();
+    setState(() => _playing = true);
+    _timer = Timer.periodic(const Duration(milliseconds: 800), (_) {
+      if (!mounted) return;
+      setState(() => _frameIndex = (_frameIndex + 1) % max);
+    });
+  }
+
+  void _stopPlaying() {
+    _timer?.cancel();
+    setState(() => _playing = false);
+  }
+
   void _togglePlay(int max) {
     if (_playing) {
-      _timer?.cancel();
-      setState(() => _playing = false);
-      return;
+      _stopPlaying();
+    } else {
+      _startPlaying(max);
     }
-
-    setState(() => _playing = true);
-    _timer = Timer.periodic(const Duration(milliseconds: 550), (_) {
-      if (!mounted) return;
-      setState(() {
-        _frameIndex = (_frameIndex + 1) % max;
-      });
-    });
   }
 
   @override
@@ -1675,9 +1692,11 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
                     maxZoom: 11,
                   ),
                   children: [
+                    // Base map without labels, so town names and highways can
+                    // sit on top of the radar instead of being hidden under it.
                     TileLayer(
                       urlTemplate:
-                          'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+                          'https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}.png',
                       subdomains: const ['a', 'b', 'c'],
                       maxNativeZoom: 19,
                       userAgentPackageName: 'ca.alberta.weather',
@@ -1688,6 +1707,19 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
                       // server returns a "Zoom Level Not Supported" placeholder, so
                       // cap native fetch at 7 and let flutter_map upscale.
                       maxNativeZoom: 7,
+                      // Cross-dissolve each frame into the next so the loop reads
+                      // smoothly instead of hard-cutting between 10-min steps.
+                      tileDisplay: const TileDisplay.fadeIn(
+                        duration: Duration(milliseconds: 500),
+                      ),
+                    ),
+                    // Labels (town names, highways) painted above the radar.
+                    TileLayer(
+                      urlTemplate:
+                          'https://{s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}.png',
+                      subdomains: const ['a', 'b', 'c'],
+                      maxNativeZoom: 19,
+                      userAgentPackageName: 'ca.alberta.weather',
                     ),
                   ],
                 ),
