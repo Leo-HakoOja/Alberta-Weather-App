@@ -11,10 +11,18 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 
 class _RadarFrame {
-  const _RadarFrame({required this.path, required this.unixTime});
+  const _RadarFrame({
+    required this.path,
+    required this.unixTime,
+    this.forecast = false,
+  });
 
   final String path;
   final int unixTime;
+
+  /// True for RainViewer nowcast frames (predicted, ~30 min ahead) as opposed
+  /// to observed past radar.
+  final bool forecast;
 
   String tileUrlTemplate() {
     return 'https://tilecache.rainviewer.com$path/256/{z}/{x}/{y}/6/1_1.png';
@@ -289,7 +297,10 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
     final past = radar['past'] as List<dynamic>? ?? const [];
     final nowcast = radar['nowcast'] as List<dynamic>? ?? const [];
 
-    List<_RadarFrame> parseFrames(List<dynamic> source) {
+    List<_RadarFrame> parseFrames(
+      List<dynamic> source, {
+      bool forecast = false,
+    }) {
       return source
           .whereType<Map<String, dynamic>>()
           .map((item) {
@@ -298,17 +309,18 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
             if (path is! String || time is! int) {
               return null;
             }
-            return _RadarFrame(path: path, unixTime: time);
+            return _RadarFrame(path: path, unixTime: time, forecast: forecast);
           })
           .whereType<_RadarFrame>()
           .toList();
     }
 
-    // Use observed radar frames by default so map and forecast feel consistent.
-    final observedFrames = parseFrames(past);
-    final frames = observedFrames.isNotEmpty
-        ? observedFrames
-        : parseFrames(nowcast);
+    // Observed past radar, then RainViewer's short nowcast (predicted ~30 min)
+    // so the loop plays straight through into the near future.
+    final frames = [
+      ...parseFrames(past),
+      ...parseFrames(nowcast, forecast: true),
+    ]..sort((a, b) => a.unixTime.compareTo(b.unixTime));
 
     if (frames.isEmpty) {
       throw Exception('No radar frames available');
@@ -1574,9 +1586,7 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
   Timer? _timer;
   int _frameIndex = 0;
   bool _playing = false;
-  int _windowMinutes = 120;
-  // Number of frames in the currently selected loop window; kept in sync by
-  // build() and read by the playback timer.
+  // Total frames in the loop; kept in sync by build() and read by the timer.
   int _loopFrameCount = 1;
 
   @override
@@ -1622,13 +1632,6 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
     }
   }
 
-  void _setWindow(int minutes) {
-    setState(() {
-      _windowMinutes = minutes;
-      _frameIndex = 0;
-    });
-  }
-
   @override
   Widget build(BuildContext context) {
     return Container(
@@ -1643,20 +1646,14 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
             return const Center(child: CircularProgressIndicator());
           }
 
-          final allFrames = snapshot.data!.frames;
-          if (allFrames.isEmpty) {
+          final frames = snapshot.data!.frames;
+          if (frames.isEmpty) {
             return const Center(
               child: Text(
                 'Radar temporarily unavailable.',
                 style: TextStyle(color: Colors.white70),
               ),
             );
-          }
-          // Trim to the selected loop window (most recent N minutes of radar).
-          final cutoff = allFrames.last.unixTime - _windowMinutes * 60;
-          var frames = allFrames.where((f) => f.unixTime >= cutoff).toList();
-          if (frames.length < 2) {
-            frames = allFrames;
           }
           _loopFrameCount = frames.length;
           if (_frameIndex >= frames.length) {
@@ -1695,6 +1692,28 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
                         ),
                       ),
                     ),
+                    if (frame.forecast) ...[
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 3,
+                        ),
+                        decoration: BoxDecoration(
+                          color: _albertaGold,
+                          borderRadius: BorderRadius.circular(999),
+                        ),
+                        child: const Text(
+                          'FORECAST',
+                          style: TextStyle(
+                            color: _albertaBlue,
+                            fontWeight: FontWeight.w800,
+                            fontSize: 11,
+                            letterSpacing: 0.5,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                    ],
                     Text(
                       '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}',
                       style: const TextStyle(color: Colors.white70),
@@ -1772,37 +1791,6 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
                             _frameIndex = value.round();
                           });
                         },
-                      ),
-                    ),
-                    const SizedBox(width: 4),
-                    PopupMenuButton<int>(
-                      initialValue: _windowMinutes,
-                      onSelected: _setWindow,
-                      tooltip: 'Loop length',
-                      itemBuilder: (_) => const [
-                        PopupMenuItem(value: 30, child: Text('Last 30 min')),
-                        PopupMenuItem(value: 60, child: Text('Last hour')),
-                        PopupMenuItem(value: 120, child: Text('Last 2 hours')),
-                      ],
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Text(
-                            _windowMinutes == 30
-                                ? '30 min'
-                                : _windowMinutes == 60
-                                ? '1 h'
-                                : '2 h',
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                          const Icon(
-                            Icons.arrow_drop_down,
-                            color: Colors.white,
-                          ),
-                        ],
                       ),
                     ),
                   ],
