@@ -4,8 +4,10 @@ import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 
 class _RadarFrame {
@@ -41,27 +43,50 @@ class _SavedLocation {
   final double latitude;
   final double longitude;
   final String timezone;
+
+  bool sameSpotAs(_SavedLocation other) =>
+      (latitude - other.latitude).abs() < 0.0001 &&
+      (longitude - other.longitude).abs() < 0.0001;
+
+  Map<String, dynamic> toJson() => {
+    'name': name,
+    'province': province,
+    'latitude': latitude,
+    'longitude': longitude,
+    'timezone': timezone,
+  };
+
+  static _SavedLocation? fromJson(Map<String, dynamic> json) {
+    final lat = _toDouble(json['latitude']);
+    final lon = _toDouble(json['longitude']);
+    if (lat == null || lon == null) {
+      return null;
+    }
+    return _SavedLocation(
+      name: '${json['name'] ?? 'Location'}',
+      province: '${json['province'] ?? 'AB'}',
+      latitude: lat,
+      longitude: lon,
+      timezone: '${json['timezone'] ?? 'America/Edmonton'}',
+    );
+  }
 }
 
 const _albertaBlue = Color(0xFF0B3A82);
 const _albertaSky = Color(0xFF2F6FB2);
 const _albertaGold = Color(0xFFF2C94C);
 const _prairieCream = Color(0xFFFFF9EC);
+// Edmonton, the provincial capital, is the default Location on first launch
+// when no base has been set.
+const _edmonton = _SavedLocation(
+  name: 'Edmonton',
+  province: 'AB',
+  latitude: 53.5461,
+  longitude: -113.4938,
+  timezone: 'America/Edmonton',
+);
 const _defaultSavedLocations = <_SavedLocation>[
-  _SavedLocation(
-    name: 'Myrnam',
-    province: 'AB',
-    latitude: 53.66686,
-    longitude: -111.23504,
-    timezone: 'America/Edmonton',
-  ),
-  _SavedLocation(
-    name: 'Edmonton',
-    province: 'AB',
-    latitude: 53.5461,
-    longitude: -113.4938,
-    timezone: 'America/Edmonton',
-  ),
+  _edmonton,
   _SavedLocation(
     name: 'Calgary',
     province: 'AB',
@@ -70,13 +95,21 @@ const _defaultSavedLocations = <_SavedLocation>[
     timezone: 'America/Edmonton',
   ),
   _SavedLocation(
-    name: 'Vancouver',
-    province: 'BC',
-    latitude: 49.2827,
-    longitude: -123.1207,
-    timezone: 'America/Vancouver',
+    name: 'Myrnam',
+    province: 'AB',
+    latitude: 53.66686,
+    longitude: -111.23504,
+    timezone: 'America/Edmonton',
   ),
 ];
+
+// Approximate provincial bounding box used to keep GPS-resolved Locations
+// inside Alberta (lat 49N-60N, lon 110W-120W).
+const _albertaLatMin = 48.9;
+const _albertaLatMax = 60.1;
+const _albertaLonMin = -120.1;
+const _albertaLonMax = -109.9;
+const _baseLocationPrefsKey = 'base_location';
 
 void main() {
   runApp(const WeatherApp());
@@ -134,16 +167,57 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
   late Future<_RadarTimeline> _radarFuture;
   late List<_SavedLocation> _savedLocations;
   late _SavedLocation _selectedLocation;
+  _SavedLocation? _baseLocation;
+  bool _locating = false;
 
   @override
   void initState() {
     super.initState();
     _savedLocations = List<_SavedLocation>.from(_defaultSavedLocations);
-    _selectedLocation = _savedLocations.first;
+    _selectedLocation = _edmonton;
     _weatherFuture = _fetchWeather();
     _radarFuture = _fetchRadarTimeline().catchError(
       (_) => const _RadarTimeline(frames: []),
     );
+    _restoreBaseLocation();
+  }
+
+  // Opens on the operator's chosen base Location if one was saved; otherwise
+  // stays on Edmonton (set in initState).
+  Future<void> _restoreBaseLocation() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_baseLocationPrefsKey);
+    if (raw == null) {
+      return;
+    }
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map<String, dynamic>) {
+      return;
+    }
+    final base = _SavedLocation.fromJson(decoded);
+    if (base == null || !mounted) {
+      return;
+    }
+    setState(() {
+      _baseLocation = base;
+      final alreadySaved = _savedLocations.any(base.sameSpotAs);
+      if (!alreadySaved) {
+        _savedLocations = [..._savedLocations, base];
+      }
+      _selectedLocation = base;
+      _weatherFuture = _fetchWeather();
+    });
+  }
+
+  Future<void> _setAsBase(_SavedLocation location) async {
+    setState(() => _baseLocation = location);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_baseLocationPrefsKey, jsonEncode(location.toJson()));
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('${location.name} set as your base location.')),
+      );
+    }
   }
 
   String _resolvedApiUrl() {
@@ -255,17 +329,82 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
 
   void _selectLocation(_SavedLocation location) {
     setState(() {
-      final exists = _savedLocations.any(
-        (saved) =>
-            (saved.latitude - location.latitude).abs() < 0.0001 &&
-            (saved.longitude - location.longitude).abs() < 0.0001,
-      );
-      if (!exists) {
+      if (!_savedLocations.any(location.sameSpotAs)) {
         _savedLocations = [..._savedLocations, location];
       }
       _selectedLocation = location;
       _weatherFuture = _fetchWeather();
     });
+  }
+
+  // The location button: ask for the device location once and switch to the
+  // Albertan's current spot. Stays inside the province per the product scope.
+  Future<void> _useCurrentLocation() async {
+    if (_locating) {
+      return;
+    }
+    setState(() => _locating = true);
+    try {
+      if (!await Geolocator.isLocationServiceEnabled()) {
+        _showLocationMessage('Turn on location services to use this.');
+        return;
+      }
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        _showLocationMessage('Location permission denied.');
+        return;
+      }
+
+      final position = await Geolocator.getCurrentPosition();
+      final lat = position.latitude;
+      final lon = position.longitude;
+      final inAlberta =
+          lat >= _albertaLatMin &&
+          lat <= _albertaLatMax &&
+          lon >= _albertaLonMin &&
+          lon <= _albertaLonMax;
+      if (!inAlberta) {
+        _showLocationMessage(
+          'Alberta Weather only covers locations in Alberta.',
+        );
+        return;
+      }
+
+      final current = _SavedLocation(
+        name: 'Current location',
+        province: 'AB',
+        latitude: lat,
+        longitude: lon,
+        timezone: 'America/Edmonton',
+      );
+      setState(() {
+        _savedLocations = [
+          ..._savedLocations.where((l) => l.name != 'Current location'),
+          current,
+        ];
+        _selectedLocation = current;
+        _weatherFuture = _fetchWeather();
+      });
+    } catch (_) {
+      _showLocationMessage('Could not get your location.');
+    } finally {
+      if (mounted) {
+        setState(() => _locating = false);
+      }
+    }
+  }
+
+  void _showLocationMessage(String message) {
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   Future<List<_SavedLocation>> _searchLocations(String query) async {
@@ -324,7 +463,9 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
         return _LocationPickerSheet(
           selectedLocation: _selectedLocation,
           savedLocations: _savedLocations,
+          baseLocation: _baseLocation,
           onSearch: _searchLocations,
+          onSetBase: _setAsBase,
         );
       },
     );
@@ -545,7 +686,8 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
           final daily7 = (weatherData['daily_7d'] as List<dynamic>? ?? []);
           final daily14 =
               (weatherData['daily_14d_extended'] as List<dynamic>? ?? []);
-          final sources = (weatherData['sources'] as List<dynamic>? ?? const []);
+          final sources =
+              (weatherData['sources'] as List<dynamic>? ?? const []);
           final dayparts =
               (weatherData['dayparts_14d'] as List<dynamic>? ?? const []);
           final daypartsByDate = <String, Map<String, dynamic>>{
@@ -559,12 +701,49 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
               RefreshIndicator(
                 onRefresh: _refresh,
                 child: ListView(
-                  padding: EdgeInsets.fromLTRB(16, 12 + MediaQuery.of(context).padding.top, 16, 24),
+                  padding: EdgeInsets.fromLTRB(
+                    16,
+                    12 + MediaQuery.of(context).padding.top,
+                    16,
+                    24,
+                  ),
                   children: [
-                    _LocationPickerButton(
-                      selected: _selectedLocation,
-                      onTap: _openLocationPicker,
-                      onLongPress: _openLocationPicker,
+                    Row(
+                      children: [
+                        Expanded(
+                          child: _LocationPickerButton(
+                            selected: _selectedLocation,
+                            onTap: _openLocationPicker,
+                            onLongPress: _openLocationPicker,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        SizedBox(
+                          height: 48,
+                          child: FilledButton(
+                            style: FilledButton.styleFrom(
+                              backgroundColor: _albertaGold,
+                              foregroundColor: _albertaBlue,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 14,
+                              ),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(14),
+                              ),
+                            ),
+                            onPressed: _locating ? null : _useCurrentLocation,
+                            child: _locating
+                                ? const SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : const Icon(Icons.my_location_rounded),
+                          ),
+                        ),
+                      ],
                     ),
                     const SizedBox(height: 12),
                     _HeroCurrentCard(
@@ -695,12 +874,16 @@ class _LocationPickerSheet extends StatefulWidget {
   const _LocationPickerSheet({
     required this.selectedLocation,
     required this.savedLocations,
+    required this.baseLocation,
     required this.onSearch,
+    required this.onSetBase,
   });
 
   final _SavedLocation selectedLocation;
   final List<_SavedLocation> savedLocations;
+  final _SavedLocation? baseLocation;
   final Future<List<_SavedLocation>> Function(String query) onSearch;
+  final void Function(_SavedLocation location) onSetBase;
 
   @override
   State<_LocationPickerSheet> createState() => _LocationPickerSheetState();
@@ -711,6 +894,13 @@ class _LocationPickerSheetState extends State<_LocationPickerSheet> {
   bool _loading = false;
   String? _error;
   List<_SavedLocation> _results = const [];
+  _SavedLocation? _base;
+
+  @override
+  void initState() {
+    super.initState();
+    _base = widget.baseLocation;
+  }
 
   @override
   void dispose() {
@@ -833,11 +1023,16 @@ class _LocationPickerSheetState extends State<_LocationPickerSheet> {
                 'Saved locations',
                 style: Theme.of(context).textTheme.titleMedium,
               ),
+              const SizedBox(height: 2),
+              Text(
+                'Tap to view. Tap the star to set your base — the location '
+                'the app opens to.',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
               const SizedBox(height: 6),
               ...widget.savedLocations.map((location) {
-                final selected =
-                    location.latitude == widget.selectedLocation.latitude &&
-                    location.longitude == widget.selectedLocation.longitude;
+                final selected = location.sameSpotAs(widget.selectedLocation);
+                final isBase = _base != null && location.sameSpotAs(_base!);
                 return ListTile(
                   dense: true,
                   contentPadding: EdgeInsets.zero,
@@ -849,6 +1044,17 @@ class _LocationPickerSheetState extends State<_LocationPickerSheet> {
                   ),
                   title: Text('${location.name}, ${location.province}'),
                   subtitle: Text(location.timezone),
+                  trailing: IconButton(
+                    icon: Icon(
+                      isBase ? Icons.star_rounded : Icons.star_border_rounded,
+                      color: isBase ? _albertaGold : null,
+                    ),
+                    tooltip: isBase ? 'Base location' : 'Set as base',
+                    onPressed: () {
+                      setState(() => _base = location);
+                      widget.onSetBase(location);
+                    },
+                  ),
                   onTap: () => Navigator.of(context).pop(location),
                 );
               }),
@@ -979,9 +1185,8 @@ class _HeroCurrentCard extends StatelessWidget {
       ),
       child: Padding(
         padding: const EdgeInsets.all(18),
-        child: IntrinsicHeight(
-          child: Row(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Expanded(
               child: Column(
@@ -1068,25 +1273,30 @@ class _HeroCurrentCard extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 12),
-            AspectRatio(
-              aspectRatio: 110 / 203,
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  ClipPath(
-                    clipper: const _AlbertaShapeClipper(),
-                    child: _RadarPreviewCard(
-                      timelineFuture: radarFuture,
-                      location: selectedLocation,
-                      onTap: onRadarTap,
-                    ),
+            SizedBox(
+              width: 110,
+              child: AspectRatio(
+                aspectRatio: 110 / 203,
+                child: GestureDetector(
+                  onTap: onRadarTap,
+                  behavior: HitTestBehavior.opaque,
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      ClipPath(
+                        clipper: const _AlbertaShapeClipper(),
+                        child: _RadarPreviewCard(
+                          timelineFuture: radarFuture,
+                          location: selectedLocation,
+                        ),
+                      ),
+                      CustomPaint(painter: const _AlbertaBorderPainter()),
+                    ],
                   ),
-                  CustomPaint(painter: const _AlbertaBorderPainter()),
-                ],
+                ),
               ),
             ),
           ],
-        ),
         ),
       ),
     );
@@ -1157,11 +1367,7 @@ class _SourceComparisonStrip extends StatelessWidget {
 
     if (chips.isEmpty) return const SizedBox.shrink();
 
-    return Wrap(
-      spacing: 6,
-      runSpacing: 6,
-      children: chips,
-    );
+    return Wrap(spacing: 6, runSpacing: 6, children: chips);
   }
 }
 
@@ -1169,91 +1375,86 @@ class _RadarPreviewCard extends StatelessWidget {
   const _RadarPreviewCard({
     required this.timelineFuture,
     required this.location,
-    required this.onTap,
   });
 
   final Future<_RadarTimeline> timelineFuture;
   final _SavedLocation location;
-  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          FutureBuilder<_RadarTimeline>(
-            future: timelineFuture,
-            builder: (context, snapshot) {
-              if (!snapshot.hasData || snapshot.data!.latestOrNull == null) {
-                return Container(
-                  color: Colors.black.withValues(alpha: 0.25),
-                  alignment: Alignment.center,
-                  child: const Icon(Icons.radar, color: Colors.white70, size: 36),
-                );
-              }
-              return FlutterMap(
-                options: MapOptions(
-                  initialCameraFit: CameraFit.bounds(
-                    bounds: LatLngBounds(
-                      const LatLng(48.9, -120.1),
-                      const LatLng(60.1, -109.9),
-                    ),
-                    padding: const EdgeInsets.all(4),
-                  ),
-                  interactionOptions: const InteractionOptions(
-                    flags: InteractiveFlag.none,
-                  ),
-                ),
-                children: [
-                  TileLayer(
-                    urlTemplate:
-                        'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
-                    userAgentPackageName: 'ca.alberta.weather',
-                  ),
-                  TileLayer(
-                    urlTemplate: snapshot.data!.latestOrNull!.tileUrlTemplate(),
-                    maxNativeZoom: 9,
-                  ),
-                ],
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        FutureBuilder<_RadarTimeline>(
+          future: timelineFuture,
+          builder: (context, snapshot) {
+            if (!snapshot.hasData || snapshot.data!.latestOrNull == null) {
+              return Container(
+                color: Colors.black.withValues(alpha: 0.25),
+                alignment: Alignment.center,
+                child: const Icon(Icons.radar, color: Colors.white70, size: 36),
               );
-            },
-          ),
-          DecoratedBox(
-            decoration: BoxDecoration(
-              gradient: RadialGradient(
-                center: Alignment.center,
-                radius: 1.0,
-                colors: [
-                  Colors.transparent,
-                  Colors.black.withValues(alpha: 0.38),
-                ],
-                stops: const [0.6, 1],
-              ),
-            ),
-          ),
-          Positioned(
-            right: 10,
-            bottom: 10,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              decoration: BoxDecoration(
-                color: Colors.black.withValues(alpha: 0.45),
-                borderRadius: BorderRadius.circular(10),
-              ),
-              child: const Text(
-                'Radar',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
+            }
+            return FlutterMap(
+              options: MapOptions(
+                initialCameraFit: CameraFit.bounds(
+                  bounds: LatLngBounds(
+                    const LatLng(48.9, -120.1),
+                    const LatLng(60.1, -109.9),
+                  ),
+                  padding: const EdgeInsets.all(4),
+                ),
+                interactionOptions: const InteractionOptions(
+                  flags: InteractiveFlag.none,
                 ),
               ),
+              children: [
+                TileLayer(
+                  urlTemplate:
+                      'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+                  userAgentPackageName: 'ca.alberta.weather',
+                ),
+                TileLayer(
+                  urlTemplate: snapshot.data!.latestOrNull!.tileUrlTemplate(),
+                  maxNativeZoom: 9,
+                ),
+              ],
+            );
+          },
+        ),
+        DecoratedBox(
+          decoration: BoxDecoration(
+            gradient: RadialGradient(
+              center: Alignment.center,
+              radius: 1.0,
+              colors: [
+                Colors.transparent,
+                Colors.black.withValues(alpha: 0.38),
+              ],
+              stops: const [0.6, 1],
             ),
           ),
-        ],
-      ),
+        ),
+        Positioned(
+          right: 10,
+          bottom: 10,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: Colors.black.withValues(alpha: 0.45),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: const Text(
+              'Radar',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
@@ -1262,7 +1463,7 @@ class _RadarPreviewCard extends StatelessWidget {
 // (Ramer-Douglas-Peucker ε=0.05°). Normalised to bounding box
 // [48.993–60.0°N, 120.001–109.999°W]: x=0→120°W, x=1→110°W, y=0→60°N, y=1→49°N.
 const List<Offset> _kAlbertaNorm = [
-  Offset(1.0,    1.0),
+  Offset(1.0, 1.0),
   Offset(0.5936, 1.0),
   Offset(0.5846, 0.9859),
   Offset(0.5624, 0.9807),
@@ -1272,19 +1473,19 @@ const List<Offset> _kAlbertaNorm = [
   Offset(0.5375, 0.9284),
   Offset(0.5339, 0.9026),
   Offset(0.5225, 0.8763),
-  Offset(0.5,    0.8573),
-  Offset(0.478,  0.8585),
+  Offset(0.5, 0.8573),
+  Offset(0.478, 0.8585),
   Offset(0.4665, 0.8426),
   Offset(0.4354, 0.8311),
   Offset(0.4428, 0.8267),
-  Offset(0.438,  0.8203),
+  Offset(0.438, 0.8203),
   Offset(0.3743, 0.7891),
   Offset(0.3705, 0.7767),
   Offset(0.3424, 0.7591),
   Offset(0.3329, 0.7444),
   Offset(0.3063, 0.7522),
   Offset(0.2682, 0.7102),
-  Offset(0.241,  0.7149),
+  Offset(0.241, 0.7149),
   Offset(0.2247, 0.7086),
   Offset(0.2179, 0.7014),
   Offset(0.2264, 0.6912),
@@ -1293,7 +1494,7 @@ const List<Offset> _kAlbertaNorm = [
   Offset(0.1793, 0.683),
   Offset(0.1653, 0.6708),
   Offset(0.1695, 0.6652),
-  Offset(0.158,  0.6504),
+  Offset(0.158, 0.6504),
   Offset(0.1377, 0.6462),
   Offset(0.1329, 0.6328),
   Offset(0.1224, 0.6311),
@@ -1307,10 +1508,10 @@ const List<Offset> _kAlbertaNorm = [
   Offset(0.0096, 0.5885),
   Offset(0.0074, 0.5801),
   Offset(0.0268, 0.5793),
-  Offset(0.0,    0.5612),
+  Offset(0.0, 0.5612),
   Offset(0.0001, 0.0),
   Offset(0.9999, 0.0),
-  Offset(1.0,    1.0),
+  Offset(1.0, 1.0),
 ];
 
 class _AlbertaShapeClipper extends CustomClipper<ui.Path> {
@@ -1462,19 +1663,20 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
               Expanded(
                 child: FlutterMap(
                   options: MapOptions(
-                    initialCameraFit: CameraFit.bounds(
-                      bounds: LatLngBounds(
-                        const LatLng(48.9, -120.1),
-                        const LatLng(60.1, -109.9),
-                      ),
-                      padding: const EdgeInsets.all(16),
+                    initialCenter: LatLng(
+                      widget.location.latitude,
+                      widget.location.longitude,
                     ),
+                    initialZoom: 8,
                     minZoom: 4,
+                    maxZoom: 11,
                   ),
                   children: [
                     TileLayer(
                       urlTemplate:
                           'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+                      subdomains: const ['a', 'b', 'c'],
+                      maxNativeZoom: 19,
                       userAgentPackageName: 'ca.alberta.weather',
                     ),
                     TileLayer(
