@@ -1416,7 +1416,10 @@ class _RadarPreviewCard extends StatelessWidget {
                 ),
                 TileLayer(
                   urlTemplate: snapshot.data!.latestOrNull!.tileUrlTemplate(),
-                  maxNativeZoom: 9,
+                  // RainViewer radar tiles only exist up to z7; above that the
+                  // server returns a "Zoom Level Not Supported" placeholder, so
+                  // cap native fetch at 7 and let flutter_map upscale.
+                  maxNativeZoom: 7,
                 ),
               ],
             );
@@ -1681,7 +1684,10 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
                     ),
                     TileLayer(
                       urlTemplate: frame.tileUrlTemplate(),
-                      maxNativeZoom: 9,
+                      // RainViewer radar tiles only exist up to z7; above that the
+                      // server returns a "Zoom Level Not Supported" placeholder, so
+                      // cap native fetch at 7 and let flutter_map upscale.
+                      maxNativeZoom: 7,
                     ),
                   ],
                 ),
