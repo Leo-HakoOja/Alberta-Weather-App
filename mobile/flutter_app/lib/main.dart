@@ -7,7 +7,9 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart';
 
 class _RadarFrame {
@@ -93,6 +95,14 @@ const _edmonton = _SavedLocation(
   longitude: -113.4938,
   timezone: 'America/Edmonton',
 );
+const _myrnamLocation = _SavedLocation(
+  name: 'Myrnam',
+  province: 'AB',
+  latitude: 53.66686,
+  longitude: -111.23504,
+  timezone: 'America/Edmonton',
+);
+const bool _testGroup = bool.fromEnvironment('TEST_GROUP');
 const _defaultSavedLocations = <_SavedLocation>[
   _edmonton,
   _SavedLocation(
@@ -100,13 +110,6 @@ const _defaultSavedLocations = <_SavedLocation>[
     province: 'AB',
     latitude: 51.0447,
     longitude: -114.0719,
-    timezone: 'America/Edmonton',
-  ),
-  _SavedLocation(
-    name: 'Myrnam',
-    province: 'AB',
-    latitude: 53.66686,
-    longitude: -111.23504,
     timezone: 'America/Edmonton',
   ),
 ];
@@ -181,7 +184,10 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
   @override
   void initState() {
     super.initState();
-    _savedLocations = List<_SavedLocation>.from(_defaultSavedLocations);
+    _savedLocations = [
+      ..._defaultSavedLocations,
+      if (_testGroup) _myrnamLocation,
+    ];
     _selectedLocation = _edmonton;
     _weatherFuture = _fetchWeather();
     _radarFuture = _fetchRadarTimeline().catchError(
@@ -827,6 +833,7 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
                         ),
                       );
                     }),
+                    const _BuiltByFooter(),
                   ],
                 ),
               ),
@@ -2800,4 +2807,84 @@ Widget _cloudMoonGlyph({required double size}) {
       ],
     ),
   );
+}
+
+class _BuiltByFooter extends StatelessWidget {
+  const _BuiltByFooter();
+
+  static const _siteUrl = 'https://hakoojaservices.ca';
+
+  // Colours lifted from hako-oja-react cta-metal / hammered-copper-surface
+  static const _copperBorder = Color(0xD9D48A61);   // rgba(212,138,97,0.85)
+  static const _copperText   = Color(0xFFE6AE84);   // --copper-1
+  static const _copperGlow   = Color(0x40D48A61);   // rgba(212,138,97,0.25)
+
+  Future<void> _launch() async {
+    final uri = Uri.parse(_siteUrl);
+    if (await canLaunchUrl(uri)) {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 32, bottom: 12),
+      child: Center(
+        child: GestureDetector(
+          onTap: _launch,
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(16),
+            child: BackdropFilter(
+              filter: ui.ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+              child: Container(
+                width: 260,
+                padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 20),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(16),
+                  gradient: const LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [
+                      Color(0xE8251510),
+                      Color(0xF01A0D08),
+                      Color(0xF6100705),
+                      Color(0xFC080402),
+                    ],
+                    stops: [0.0, 0.38, 0.70, 1.0],
+                  ),
+                  border: Border.all(color: _copperBorder, width: 1.2),
+                  boxShadow: const [
+                    BoxShadow(color: _copperGlow, blurRadius: 24, spreadRadius: 2),
+                  ],
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      'This application was built by',
+                      style: TextStyle(
+                        fontSize: 11,
+                        letterSpacing: 0.7,
+                        color: _copperText,
+                        shadows: const [
+                          Shadow(color: Color(0x996F3524), blurRadius: 12),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+                    SvgPicture.asset(
+                      'assets/images/hakooja_logo.svg',
+                      height: 112,
+                      fit: BoxFit.contain,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
