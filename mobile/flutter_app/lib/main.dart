@@ -95,14 +95,6 @@ const _edmonton = _SavedLocation(
   longitude: -113.4938,
   timezone: 'America/Edmonton',
 );
-const _myrnamLocation = _SavedLocation(
-  name: 'Myrnam',
-  province: 'AB',
-  latitude: 53.66686,
-  longitude: -111.23504,
-  timezone: 'America/Edmonton',
-);
-const bool _testGroup = bool.fromEnvironment('TEST_GROUP');
 const _defaultSavedLocations = <_SavedLocation>[
   _edmonton,
   _SavedLocation(
@@ -184,33 +176,38 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
   @override
   void initState() {
     super.initState();
-    _savedLocations = [
-      ..._defaultSavedLocations,
-      if (_testGroup) _myrnamLocation,
-    ];
+    _savedLocations = [..._defaultSavedLocations];
     _selectedLocation = _edmonton;
     _weatherFuture = _fetchWeather();
     _radarFuture = _fetchRadarTimeline().catchError(
       (_) => const _RadarTimeline(frames: []),
     );
-    _restoreBaseLocation();
+    _initLocation();
   }
 
-  // Opens on the operator's chosen base Location if one was saved; otherwise
-  // stays on Edmonton (set in initState).
-  Future<void> _restoreBaseLocation() async {
+  // Opens on the operator's chosen base Location if one was saved. Otherwise
+  // tries the device's current location automatically, falling back to
+  // Edmonton (set above) if GPS is off, denied, or outside Alberta.
+  Future<void> _initLocation() async {
+    final hasBase = await _restoreBaseLocation();
+    if (!hasBase) {
+      await _useCurrentLocation(silent: true);
+    }
+  }
+
+  Future<bool> _restoreBaseLocation() async {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString(_baseLocationPrefsKey);
     if (raw == null) {
-      return;
+      return false;
     }
     final decoded = jsonDecode(raw);
     if (decoded is! Map<String, dynamic>) {
-      return;
+      return false;
     }
     final base = _SavedLocation.fromJson(decoded);
     if (base == null || !mounted) {
-      return;
+      return false;
     }
     setState(() {
       _baseLocation = base;
@@ -221,6 +218,7 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
       _selectedLocation = base;
       _weatherFuture = _fetchWeather();
     });
+    return true;
   }
 
   Future<void> _setAsBase(_SavedLocation location) async {
@@ -355,16 +353,18 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
     });
   }
 
-  // The location button: ask for the device location once and switch to the
-  // Albertan's current spot. Stays inside the province per the product scope.
-  Future<void> _useCurrentLocation() async {
+  // Resolves the device's current spot and switches to it. Used both by the
+  // location button (silent: false, reports failures via snackbar) and by
+  // app launch (silent: true, fails quietly back to Edmonton). Stays inside
+  // the province per the product scope.
+  Future<void> _useCurrentLocation({bool silent = false}) async {
     if (_locating) {
       return;
     }
     setState(() => _locating = true);
     try {
       if (!await Geolocator.isLocationServiceEnabled()) {
-        _showLocationMessage('Turn on location services to use this.');
+        if (!silent) _showLocationMessage('Turn on location services to use this.');
         return;
       }
       var permission = await Geolocator.checkPermission();
@@ -373,7 +373,7 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
       }
       if (permission == LocationPermission.denied ||
           permission == LocationPermission.deniedForever) {
-        _showLocationMessage('Location permission denied.');
+        if (!silent) _showLocationMessage('Location permission denied.');
         return;
       }
 
@@ -386,9 +386,11 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
           lon >= _albertaLonMin &&
           lon <= _albertaLonMax;
       if (!inAlberta) {
-        _showLocationMessage(
-          'Alberta Weather only covers locations in Alberta.',
-        );
+        if (!silent) {
+          _showLocationMessage(
+            'Alberta Weather only covers locations in Alberta.',
+          );
+        }
         return;
       }
 
@@ -408,7 +410,7 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
         _weatherFuture = _fetchWeather();
       });
     } catch (_) {
-      _showLocationMessage('Could not get your location.');
+      if (!silent) _showLocationMessage('Could not get your location.');
     } finally {
       if (mounted) {
         setState(() => _locating = false);
