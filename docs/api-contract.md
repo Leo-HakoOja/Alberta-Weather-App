@@ -1,4 +1,4 @@
-# API Contract (v1.1)
+# API Contract (v1.2)
 
 ## Base URL
 - Local dev: `http://localhost:8000`
@@ -57,9 +57,20 @@ Query params:
       "hourly_next_24h": [],
       "daily_7d": [],
       "error": null
+    },
+    {
+      "source_id": "apple-weatherkit",
+      "source_name": "Apple Weather",
+      "attribution_url": "https://weatherkit.apple.com/attribution/en-CA",
+      "fetched_at": "...",
+      "current": {},
+      "hourly_next_24h": [],
+      "daily_7d": [],
+      "error": null
     }
   ],
-  "schema_version": "1.1.0",
+  "alerts": [],
+  "schema_version": "1.2.0",
   "source": "open-meteo.com"
 }
 ```
@@ -78,3 +89,26 @@ the Open-Meteo response and act as the default render.
 - ECCC is currently scoped to Alberta. For locations outside Alberta (or
   where no citypage site is within ~250 km), the ECCC entry returns with
   `error: "No ECCC citypage site near this location"`.
+- The ECCC entry can also report that error on a cold start: the Alberta site
+  lookup has a 15 s timeout, and a request that wakes a stopped fly.io machine
+  can exceed it. Warm requests resolve normally.
+- WeatherKit (ADR 0009) reports humidity and precipitation chance as 0 to 1
+  fractions upstream; the backend converts them to percent so all three sources
+  compare directly.
+
+### Daily headline (`daily_7d`, `daily_14d_extended`)
+
+`weather_code` / `weather` on each day is the day's representative condition:
+the most common condition during daylight hours, with precipitation taking the
+headline once it covers 3 or more daylight hours. It is **not** Open-Meteo's
+daily `weather_code`, which is documented as the single most severe hour of all
+24 and made clear days read as Overcast. That upstream value is still returned
+as `weather_code_most_severe`.
+
+### Alerts (`alerts`, since 1.2.0)
+
+Active ECCC severe-weather alerts whose polygon contains the requested point,
+warnings first. Passive posture per [ADR 0005](adr/0005-severe-alerts.md): `name`,
+`text`, `risk_colour`, `region` and the timestamps are ECCC's own values, never
+reworded or truncated. An empty list is the normal case. A failed alert fetch
+also yields an empty list rather than failing the whole response.

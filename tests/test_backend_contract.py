@@ -79,7 +79,10 @@ class WeatherServiceContractTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(data["schema_version"], "1.1.0")
+        # 1.2.0 added `alerts` (ADR 0005). A version bump must move this line,
+        # which is the point of pinning it.
+        self.assertEqual(data["schema_version"], "1.2.0")
+        self.assertEqual(data["alerts"], [])
         self.assertIn("generated_at", data)
         self.assertIn("location", data)
         self.assertIn("units", data)
@@ -98,6 +101,14 @@ class WeatherServiceContractTests(unittest.TestCase):
         self.assertIsNotNone(
             data["dayparts_14d"][0]["periods"]["overnight"]["precipitation_amount_mm"]
         )
+        # The daily headline comes from the day's daylight hours, not from
+        # Open-Meteo's daily code, which is the single worst hour. Day 1 has
+        # hourly data (daylight is mostly code 3); later days have none and
+        # fall back to the daily code. The worst-hour code is kept alongside.
+        self.assertEqual(data["daily_7d"][0]["weather_code"], 3)
+        self.assertEqual(data["daily_7d"][0]["weather_code_most_severe"], 1)
+        self.assertEqual(data["daily_7d"][1]["weather_code"], 3)
+        self.assertEqual(data["daily_7d"][2]["weather_code"], 1)
         self.assertEqual(data["current"]["wind_direction_compass"], "ESE")
         self.assertIsNotNone(data["current"]["sunrise"])
         self.assertIsNotNone(data["current"]["sunset"])
@@ -114,7 +125,7 @@ class WeatherServiceContractTests(unittest.TestCase):
         )
 
         validated = WeatherResponse.model_validate(data)
-        self.assertEqual(validated.schema_version, "1.1.0")
+        self.assertEqual(validated.schema_version, "1.2.0")
         self.assertEqual(len(validated.sources), 1)
 
     def test_forecast_fetch_uses_in_memory_cache(self) -> None:
