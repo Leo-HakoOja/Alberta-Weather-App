@@ -1,9 +1,17 @@
 # Radar migrates to ECCC GeoMet and gains a forecast mode
 
-> **Status:** GeoMet observed migration is **built** (2026-09-10): `RADAR_1KM_RRAI`
-> primary, RainViewer fallback, attribution shown, exact-match timestamps pinned by
-> `test/radar_test.dart`. Forecast mode is **deferred to v1.1** (operator,
-> 2026-09-10). See "Cold read" finding 9.
+> **Status:** Both halves are **built**. GeoMet observed migration shipped
+> 2026-09-10 (`RADAR_1KM_RRAI` primary, RainViewer fallback, exact-match timestamps
+> pinned by `test/radar_test.dart`). Forecast mode was first deferred to v1.1, then
+> **pulled forward by the operator the same day** once the plan changed to running
+> TestFlight builds on his own phone for a while before any App Store submission,
+> which removed the review-budget reason for deferring it. It is also now the only
+> predictive radar in the app: RainViewer's nowcast feed was returning zero frames as
+> of 2026-09-10, so the old ~30 min FORECAST tail no longer exists.
+>
+> Shipped with a **24 hour** horizon (open question 1 below), not 48: 24 frames keep a
+> full-viewport loop inside Flutter's default ImageCache, where 48 would evict and
+> re-fetch on every pass. Extending it is one constant, `_forecastHorizonHours`.
 
 Radar becomes a two-mode surface backed by one **Weather Source**: **Observed** (what fell, last ~3 h) and **Forecast** (what is coming, next 48 h). Both come from ECCC GeoMet. RainViewer drops to the fallback role [ADR 0004](0004-radar-single-source.md) always intended for it.
 

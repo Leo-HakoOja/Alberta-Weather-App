@@ -7,13 +7,13 @@ and [ADR 0008](adr/0008-forecast-radar-mode.md) (GeoMet migration, forecast mode
 
 WMS at `https://geo.weather.gc.ca/geomet?`
 
-| | Observed (shipped) | Forecast (deferred to v1.1) |
+| | Observed (shipped) | Forecast (shipped) |
 |---|---|---|
 | Layer | `RADAR_1KM_RRAI` | `HRDPS.CONTINENTAL_RT` |
 | Quantity | Radar precipitation rate for rain, mm/h | Instantaneous precipitation rate, mm/h |
 | Resolution | 1 km composite | 2.5 km model |
 | Step | `PT6M` | `PT1H` |
-| Window | ~3 h rolling, 31 frames | 48 h ahead |
+| Window | ~3 h rolling, 31 frames | next 24 h shown (48 h published) |
 | Style | `Radar-Rain_Dis-14colors` | `PRECIPPRTMMH` |
 
 Notes that cost time to rediscover:
@@ -39,8 +39,9 @@ Notes that cost time to rediscover:
 `https://api.rainviewer.com/public/weather-maps.json`
 
 Used only when GeoMet is unreachable, per ADR 0004. Tiles stop at z7, so its layer
-keeps `maxNativeZoom: 7` and upscales above that. Its ~30 min nowcast tail is kept
-and badged FORECAST. The radar sheet says which source is live.
+keeps `maxNativeZoom: 7` and upscales above that. Its ~30 min nowcast is gone: the
+feed returned zero nowcast frames as of 2026-09-10, so the only predictive radar is
+the HRDPS forecast mode. The radar sheet says which source is live.
 
 ## Base map
 

@@ -92,4 +92,128 @@ void main() {
       expect(frames.length, 40);
     });
   });
+  // -------------------------------------------------------------------------
+  // Forecast mode (ADR 0008).
+  // -------------------------------------------------------------------------
+
+  group('geoMetTimeExtentForLayer', () {
+    // Shaped like a filtered GetCapabilities: the parent group layer and its
+    // own, wider time dimension come first, and the layer carries a
+    // reference_time dimension ahead of its time dimension.
+    const caps = r'''
+<Layer><Name>HRDPS</Name>
+<Dimension name="time" units="ISO8601">2026-09-09T00:00:00Z/2026-09-12T12:00:00Z/PT1H</Dimension>
+<Layer queryable="1"><Name>HRDPS.CONTINENTAL_RT</Name><Title>rate</Title>
+<Dimension name="reference_time" units="ISO8601">2026-09-09T06:00:00Z/2026-09-10T12:00:00Z/PT6H</Dimension>
+<Dimension name="time" units="ISO8601" nearestValue="0">2026-09-10T13:00:00Z/2026-09-12T12:00:00Z/PT1H</Dimension>
+</Layer></Layer>''';
+
+    test('reads the named layer, not the parent group listed first', () {
+      expect(
+        geoMetTimeExtentForLayer(caps, 'HRDPS.CONTINENTAL_RT'),
+        '2026-09-10T13:00:00Z/2026-09-12T12:00:00Z/PT1H',
+      );
+    });
+
+    test('returns null for a layer the document does not contain', () {
+      expect(geoMetTimeExtentForLayer(caps, 'HRDPS.CONTINENTAL_PR'), isNull);
+    });
+  });
+
+  group('parseGeoMetExtent', () {
+    test('parses start, end and step', () {
+      final e = parseGeoMetExtent(
+        '2026-09-10T13:00:00Z/2026-09-12T12:00:00Z/PT1H',
+      )!;
+      expect(e.start, DateTime.utc(2026, 9, 10, 13));
+      expect(e.end, DateTime.utc(2026, 9, 12, 12));
+      expect(e.step, const Duration(hours: 1));
+    });
+
+    test('rejects malformed or backwards extents', () {
+      expect(parseGeoMetExtent(null), isNull);
+      expect(parseGeoMetExtent('a/b'), isNull);
+      expect(
+        parseGeoMetExtent('2026-09-10T13:00:00Z/2026-09-12T12:00:00Z/P1D'),
+        isNull,
+      );
+      expect(
+        parseGeoMetExtent('2026-09-12T12:00:00Z/2026-09-10T13:00:00Z/PT1H'),
+        isNull,
+      );
+    });
+  });
+
+  group('forecastFrameTimes', () {
+    final start = DateTime.utc(2026, 9, 10, 13);
+    final end = DateTime.utc(2026, 9, 12, 12);
+    const step = Duration(hours: 1);
+
+    test('starts at the current hour, not at the model run start', () {
+      final frames = forecastFrameTimes(
+        start: start,
+        end: end,
+        step: step,
+        now: DateTime.utc(2026, 9, 10, 19, 48),
+      );
+      expect(frames.first, DateTime.utc(2026, 9, 10, 19));
+    });
+
+    test('caps at the 24 hour horizon', () {
+      final frames = forecastFrameTimes(
+        start: start,
+        end: end,
+        step: step,
+        now: DateTime.utc(2026, 9, 10, 19, 48),
+      );
+      expect(frames.length, 24);
+      expect(frames.last, DateTime.utc(2026, 9, 11, 18));
+    });
+
+    test('only ever uses the advertised instants', () {
+      // GeoMet matches time exactly, so a frame at 19:48 would draw nothing.
+      final frames = forecastFrameTimes(
+        start: start,
+        end: end,
+        step: step,
+        now: DateTime.utc(2026, 9, 10, 19, 48, 31),
+      );
+      for (final t in frames) {
+        expect(t.minute, 0);
+        expect(t.second, 0);
+      }
+      expect(formatGeoMetTime(frames.first), '2026-09-10T19:00:00Z');
+    });
+
+    test('returns fewer frames near the end of a model run', () {
+      final frames = forecastFrameTimes(
+        start: start,
+        end: end,
+        step: step,
+        now: DateTime.utc(2026, 9, 12, 7, 10),
+      );
+      expect(frames.length, 6);
+    });
+
+    test('is empty once the run is exhausted', () {
+      final frames = forecastFrameTimes(
+        start: start,
+        end: end,
+        step: step,
+        now: DateTime.utc(2026, 9, 13),
+      );
+      expect(frames, isEmpty);
+    });
+
+    test('converts a local now to UTC before comparing', () {
+      final local = DateTime.utc(2026, 9, 10, 19, 48).toLocal();
+      final frames = forecastFrameTimes(
+        start: start,
+        end: end,
+        step: step,
+        now: local,
+      );
+      expect(frames.first, DateTime.utc(2026, 9, 10, 19));
+    });
+  });
 }
