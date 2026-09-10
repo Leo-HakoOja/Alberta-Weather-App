@@ -15,7 +15,7 @@ import json
 import math
 import time
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -142,7 +142,10 @@ def _fetch_alberta_sites() -> list[_EcccSite]:
                 longitude=float(coords[0]),
             )
         )
-    _alberta_sites_cache = (now, [site.__dict__ for site in sites])
+    # _EcccSite is a slots dataclass, so it has no __dict__. Using it here raised
+    # AttributeError on every cache write, which broke ECCC for any location that
+    # did not hit the KNOWN_ALBERTA_SITES shortcut above.
+    _alberta_sites_cache = (now, [asdict(site) for site in sites])
     return sites
 
 
