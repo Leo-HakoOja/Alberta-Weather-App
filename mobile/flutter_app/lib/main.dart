@@ -12,31 +12,143 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart';
 
+/// Which service a radar frame is fetched from.
+///
+/// ADR 0004 makes ECCC GeoMet the single radar source and RainViewer a fallback
+/// used only when GeoMet is unreachable. Both shapes are kept because they are
+/// fetched completely differently: GeoMet is a WMS that renders on demand and
+/// wants an exact timestamp, RainViewer is a static tile CDN keyed by path.
+enum _RadarSource { geomet, rainviewer }
+
+/// ECCC GeoMet, precipitation rate for rain, 1 km composite.
+const _geometBaseUrl = 'https://geo.weather.gc.ca/geomet?';
+const _geometRadarLayer = 'RADAR_1KM_RRAI';
+
+/// Discrete 14-colour ramp. The discrete styles encode to roughly a third the
+/// bytes of the continuous ones (~7 KB vs ~23 KB per tile) for the same
+/// coverage, which matters across a 31-frame loop on cellular.
+const _geometRadarStyle = 'Radar-Rain_Dis-14colors';
+
+const _radarAttribution = 'Radar: ECCC GeoMet';
+const _radarAttributionFallback = 'Radar: RainViewer (ECCC unavailable)';
+
+/// Upper bound on frames in one loop.
+///
+/// Flutter's default ImageCache holds 1000 images. A full-viewport radar loop
+/// evicts well before that, so the loop is capped to keep the second pass
+/// through the animation from re-fetching every frame.
+const _maxRadarFrames = 40;
+
+/// Parses the subset of ISO 8601 durations GeoMet uses for a time step
+/// (`PT6M`, `PT1H`). Returns null for anything else rather than guessing.
+/// Formats an instant the way GeoMet's time dimension expects it.
+///
+/// Second-precision, always UTC, no sub-second part. `DateTime.toIso8601String`
+/// emits milliseconds, which GeoMet rejects.
+@visibleForTesting
+String formatGeoMetTime(DateTime instant) {
+  final t = instant.toUtc();
+  String two(int v) => v.toString().padLeft(2, '0');
+  return '${t.year.toString().padLeft(4, '0')}-${two(t.month)}-${two(t.day)}'
+      'T${two(t.hour)}:${two(t.minute)}:${two(t.second)}Z';
+}
+
+@visibleForTesting
+Duration? parseIso8601Period(String value) {
+  final match = RegExp(
+    r'^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$',
+  ).firstMatch(value.trim());
+  if (match == null) return null;
+  final h = int.tryParse(match.group(1) ?? '0') ?? 0;
+  final m = int.tryParse(match.group(2) ?? '0') ?? 0;
+  final sec = int.tryParse(match.group(3) ?? '0') ?? 0;
+  if (h == 0 && m == 0 && sec == 0) return null;
+  return Duration(hours: h, minutes: m, seconds: sec);
+}
+
 class _RadarFrame {
   const _RadarFrame({
-    required this.path,
+    required this.source,
     required this.unixTime,
+    this.path,
     this.forecast = false,
   });
 
-  final String path;
+  final _RadarSource source;
   final int unixTime;
+
+  /// RainViewer tile path. Null for GeoMet frames, which address a frame by
+  /// timestamp rather than by path.
+  final String? path;
 
   /// True for RainViewer nowcast frames (predicted, ~30 min ahead) as opposed
   /// to observed past radar.
   final bool forecast;
 
-  String tileUrlTemplate() {
+  DateTime get utc =>
+      DateTime.fromMillisecondsSinceEpoch(unixTime * 1000, isUtc: true);
+
+  /// The exact instant string GeoMet's time dimension expects.
+  ///
+  /// The layer advertises `nearestValue="0"`, so the server matches the
+  /// requested time exactly instead of snapping to the closest frame. A value
+  /// that is off by a second returns nothing, which is why frame times are
+  /// generated from the advertised extent rather than from the device clock.
+  String get geometTime => formatGeoMetTime(utc);
+
+  String rainviewerUrlTemplate() {
     return 'https://tilecache.rainviewer.com$path/256/{z}/{x}/{y}/6/1_1.png';
   }
 }
 
 class _RadarTimeline {
-  const _RadarTimeline({required this.frames});
+  const _RadarTimeline({
+    required this.frames,
+    this.source = _RadarSource.geomet,
+  });
 
   final List<_RadarFrame> frames;
+  final _RadarSource source;
 
   _RadarFrame? get latestOrNull => frames.isEmpty ? null : frames.last;
+
+  bool get isEmpty => frames.isEmpty;
+
+  String get attribution => source == _RadarSource.geomet
+      ? _radarAttribution
+      : _radarAttributionFallback;
+}
+
+/// Builds the tile layer for one radar frame.
+///
+/// GeoMet needs no `maxNativeZoom` cap: it renders each tile on request at
+/// whatever zoom is asked for. The cap exists only on the RainViewer fallback,
+/// whose tiles stop at z7.
+Widget _radarTileLayer(_RadarFrame frame, {TileDisplay? tileDisplay}) {
+  if (frame.source == _RadarSource.geomet) {
+    return TileLayer(
+      wmsOptions: WMSTileLayerOptions(
+        baseUrl: _geometBaseUrl,
+        layers: const [_geometRadarLayer],
+        styles: const [_geometRadarStyle],
+        version: '1.3.0',
+        format: 'image/png',
+        transparent: true,
+        otherParameters: {'time': frame.geometTime},
+      ),
+      userAgentPackageName: 'ca.alberta.weather',
+      tileDisplay: tileDisplay ?? const TileDisplay.fadeIn(),
+    );
+  }
+  return TileLayer(
+    urlTemplate: frame.rainviewerUrlTemplate(),
+    // RainViewer radar tiles only exist up to z7; above that the server
+    // returns a "Zoom Level Not Supported" placeholder, so cap native fetch
+    // at 7 and let flutter_map upscale.
+    maxNativeZoom: 7,
+    userAgentPackageName: 'ca.alberta.weather',
+    tileDisplay: tileDisplay ?? const TileDisplay.fadeIn(),
+  );
 }
 
 class _SavedLocation {
@@ -113,6 +225,28 @@ const _albertaLatMax = 60.1;
 const _albertaLonMin = -120.1;
 const _albertaLonMax = -109.9;
 const _baseLocationPrefsKey = 'base_location';
+
+/// Whether a geocoder hit is a place inside Alberta.
+///
+/// The bounding box alone clips corners of BC and Saskatchewan, so when the
+/// geocoder names a province that name wins over the box.
+bool _isAlbertaPlace(Map<String, dynamic> item, double lat, double lon) {
+  final inBounds =
+      lat >= _albertaLatMin &&
+      lat <= _albertaLatMax &&
+      lon >= _albertaLonMin &&
+      lon <= _albertaLonMax;
+  if (!inBounds) return false;
+
+  final country = '${item['country_code'] ?? ''}'.toUpperCase();
+  if (country.isNotEmpty && country != 'CA') return false;
+
+  final admin1 = '${item['admin1'] ?? ''}'.trim();
+  if (admin1.isNotEmpty && admin1 != 'Alberta') return false;
+
+  return true;
+}
+
 
 void main() {
   runApp(const WeatherApp());
@@ -284,7 +418,77 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
     return decoded;
   }
 
+  /// ADR 0004: ECCC GeoMet is the radar source, RainViewer is the fallback.
   Future<_RadarTimeline> _fetchRadarTimeline() async {
+    try {
+      return await _fetchGeoMetTimeline();
+    } catch (_) {
+      // GeoMet is a render-on-demand government service; when it is down or
+      // slow the app still has to show radar, so fall through rather than
+      // surfacing an error the user can do nothing about.
+      return await _fetchRainViewerTimeline();
+    }
+  }
+
+  /// Expands GeoMet's advertised time dimension into concrete frames.
+  ///
+  /// GeoMet publishes an ISO 8601 interval (`start/end/period`) rather than a
+  /// frame list, so the frames are generated locally. This is also why the
+  /// whole capabilities document is fetched only once per refresh instead of
+  /// per frame.
+  Future<_RadarTimeline> _fetchGeoMetTimeline() async {
+    final response = await http
+        .get(
+          Uri.parse(
+            '${_geometBaseUrl}service=WMS&version=1.3.0'
+            '&request=GetCapabilities&LAYERS=$_geometRadarLayer',
+          ),
+        )
+        .timeout(const Duration(seconds: 12));
+    if (response.statusCode != 200) {
+      throw Exception('GeoMet unavailable (${response.statusCode})');
+    }
+
+    final match = RegExp(
+      r'<Dimension name="time"[^>]*>([^<]+)</Dimension>',
+    ).firstMatch(response.body);
+    if (match == null) {
+      throw Exception('GeoMet returned no time dimension');
+    }
+
+    final parts = match.group(1)!.trim().split('/');
+    if (parts.length != 3) {
+      throw Exception('Unexpected GeoMet time extent');
+    }
+
+    final start = DateTime.tryParse(parts[0])?.toUtc();
+    final end = DateTime.tryParse(parts[1])?.toUtc();
+    final step = parseIso8601Period(parts[2]);
+    if (start == null || end == null || step == null || step.inSeconds <= 0) {
+      throw Exception('Unparseable GeoMet time extent');
+    }
+
+    final frames = <_RadarFrame>[];
+    for (
+      var t = start;
+      !t.isAfter(end) && frames.length < _maxRadarFrames;
+      t = t.add(step)
+    ) {
+      frames.add(
+        _RadarFrame(
+          source: _RadarSource.geomet,
+          unixTime: t.millisecondsSinceEpoch ~/ 1000,
+        ),
+      );
+    }
+
+    if (frames.isEmpty) {
+      throw Exception('No GeoMet radar frames available');
+    }
+    return _RadarTimeline(frames: frames, source: _RadarSource.geomet);
+  }
+
+  Future<_RadarTimeline> _fetchRainViewerTimeline() async {
     final response = await http.get(
       Uri.parse('https://api.rainviewer.com/public/weather-maps.json'),
     );
@@ -313,7 +517,12 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
             if (path is! String || time is! int) {
               return null;
             }
-            return _RadarFrame(path: path, unixTime: time, forecast: forecast);
+            return _RadarFrame(
+              source: _RadarSource.rainviewer,
+              path: path,
+              unixTime: time,
+              forecast: forecast,
+            );
           })
           .whereType<_RadarFrame>()
           .toList();
@@ -330,8 +539,9 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
       throw Exception('No radar frames available');
     }
 
-    return _RadarTimeline(frames: frames);
+    return _RadarTimeline(frames: frames, source: _RadarSource.rainviewer);
   }
+
 
   Future<void> _refresh() async {
     setState(() {
@@ -455,16 +665,21 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
         .whereType<Map<String, dynamic>>()
         .map((item) {
           final name = '${item['name'] ?? 'Unknown'}';
-          final province = '${item['admin1'] ?? item['country_code'] ?? '-'}';
           final lat = _toDouble(item['latitude']);
           final lon = _toDouble(item['longitude']);
           final timezone = '${item['timezone'] ?? 'auto'}';
           if (lat == null || lon == null) {
             return null;
           }
+          // CONTEXT.md: a Saved Location is always inside Alberta. The geocoder
+          // is a world feed and will happily return Vancouver or Phoenix, so
+          // the provincial boundary is enforced here rather than trusted.
+          if (!_isAlbertaPlace(item, lat, lon)) {
+            return null;
+          }
           return _SavedLocation(
             name: name,
-            province: province,
+            province: 'AB',
             latitude: lat,
             longitude: lon,
             timezone: timezone,
@@ -708,6 +923,8 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
               (weatherData['daily_14d_extended'] as List<dynamic>? ?? []);
           final sources =
               (weatherData['sources'] as List<dynamic>? ?? const []);
+          final alerts =
+              (weatherData['alerts'] as List<dynamic>? ?? const []);
           final dayparts =
               (weatherData['dayparts_14d'] as List<dynamic>? ?? const []);
           final daypartsByDate = <String, Map<String, dynamic>>{
@@ -766,6 +983,12 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
                       ],
                     ),
                     const SizedBox(height: 12),
+                    // ADR 0005: alerts are life-safety, so they sit above the
+                    // forecast rather than inside it.
+                    if (alerts.isNotEmpty) ...[
+                      _AlertsStrip(alerts: alerts),
+                      const SizedBox(height: 12),
+                    ],
                     _HeroCurrentCard(
                       location: location,
                       current: current,
@@ -913,6 +1136,7 @@ class _LocationPickerSheet extends StatefulWidget {
 class _LocationPickerSheetState extends State<_LocationPickerSheet> {
   final TextEditingController _controller = TextEditingController();
   bool _loading = false;
+  bool _searched = false;
   String? _error;
   List<_SavedLocation> _results = const [];
   _SavedLocation? _base;
@@ -935,6 +1159,7 @@ class _LocationPickerSheetState extends State<_LocationPickerSheet> {
       setState(() {
         _results = const [];
         _error = null;
+        _searched = false;
       });
       return;
     }
@@ -949,6 +1174,7 @@ class _LocationPickerSheetState extends State<_LocationPickerSheet> {
       if (!mounted) return;
       setState(() {
         _results = found;
+        _searched = true;
       });
     } catch (err) {
       if (!mounted) return;
@@ -1019,6 +1245,15 @@ class _LocationPickerSheetState extends State<_LocationPickerSheet> {
                     style: Theme.of(
                       context,
                     ).textTheme.bodySmall?.copyWith(color: Colors.redAccent),
+                  ),
+                ),
+              if (_searched && _results.isEmpty && !_loading && _error == null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 12),
+                  child: Text(
+                    'No Alberta match. This app covers Alberta only, so '
+                    'places outside the province are not offered.',
+                    style: Theme.of(context).textTheme.bodySmall,
                   ),
                 ),
               if (_results.isNotEmpty) ...[
@@ -1206,117 +1441,141 @@ class _HeroCurrentCard extends StatelessWidget {
       ),
       child: Padding(
         padding: const EdgeInsets.all(18),
-        child: Row(
+        child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
           children: [
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    '$locationName, $province',
-                    style: theme.textTheme.titleLarge?.copyWith(
-                      fontWeight: FontWeight.w700,
-                      color: Colors.white,
-                    ),
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    'Built for Alberta days',
-                    style: theme.textTheme.labelMedium?.copyWith(
-                      color: Colors.white,
-                    ),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    '${current['time'] ?? ''}',
-                    style: theme.textTheme.bodySmall?.copyWith(
-                      color: Colors.white70,
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-                  Row(
-                    crossAxisAlignment: CrossAxisAlignment.end,
-                    children: [
-                      _weatherGlyph(
-                        weather,
-                        current['weather_code'],
-                        current['is_daylight'],
-                        _scaledGlyphSize(32),
-                        current['time'],
+            Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '$locationName, $province',
+                      style: theme.textTheme.titleLarge?.copyWith(
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white,
                       ),
-                      const SizedBox(width: 10),
-                      Text(
-                        '${_fmt(current['temperature'])}°C',
-                        style: theme.textTheme.displaySmall?.copyWith(
-                          fontWeight: FontWeight.w700,
-                          height: 1,
-                          color: Colors.white,
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      'Built for Alberta days',
+                      style: theme.textTheme.labelMedium?.copyWith(
+                        color: Colors.white,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      '${current['time'] ?? ''}',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: Colors.white70,
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: [
+                        _weatherGlyph(
+                          weather,
+                          current['weather_code'],
+                          current['is_daylight'],
+                          _scaledGlyphSize(32),
+                          current['time'],
                         ),
+                        const SizedBox(width: 10),
+                        Text(
+                          '${_fmt(current['temperature'])}°C',
+                          style: theme.textTheme.displaySmall?.copyWith(
+                            fontWeight: FontWeight.w700,
+                            height: 1,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'H ${_fmt(todayForecast?['temperature_max'])}°C   L ${_fmt(todayForecast?['temperature_min'])}°C',
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        color: Colors.white,
                       ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    'H ${_fmt(todayForecast?['temperature_max'])}°C   L ${_fmt(todayForecast?['temperature_min'])}°C',
-                    style: theme.textTheme.titleMedium?.copyWith(
-                      color: Colors.white,
                     ),
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    weather,
-                    style: theme.textTheme.titleMedium?.copyWith(
-                      color: Colors.white,
+                    const SizedBox(height: 2),
+                    Text(
+                      weather,
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        color: Colors.white,
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    'Feels like ${_fmt(current['apparent_temperature'])}°C',
-                    style: theme.textTheme.bodyMedium?.copyWith(
-                      color: Colors.white70,
+                    const SizedBox(height: 2),
+                    Text(
+                      'Feels like ${_fmt(current['apparent_temperature'])}°C',
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: Colors.white70,
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    'Sunrise ${_fmtClockFromIso(current['sunrise'])}',
-                    style: theme.textTheme.bodySmall?.copyWith(
-                      color: Colors.white70,
+                    const SizedBox(height: 2),
+                    Text(
+                      'Sunrise ${_fmtClockFromIso(current['sunrise'])}',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: Colors.white70,
+                      ),
                     ),
-                  ),
-                  Text(
-                    'Sunset ${_fmtClockFromIso(current['sunset'])}',
-                    style: theme.textTheme.bodySmall?.copyWith(
-                      color: Colors.white70,
+                    Text(
+                      'Sunset ${_fmtClockFromIso(current['sunset'])}',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: Colors.white70,
+                      ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
-            ),
-            const SizedBox(width: 12),
-            SizedBox(
-              width: 110,
-              child: AspectRatio(
-                aspectRatio: 110 / 203,
-                child: GestureDetector(
-                  onTap: onRadarTap,
-                  behavior: HitTestBehavior.opaque,
-                  child: Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      ClipPath(
-                        clipper: const _AlbertaShapeClipper(),
-                        child: _RadarPreviewCard(
-                          timelineFuture: radarFuture,
-                          location: selectedLocation,
+              const SizedBox(width: 12),
+              SizedBox(
+                // Sized so the Alberta cutout stands the full height of the text
+                // column beside it (~236pt) instead of stopping short. Width and
+                // height move together: the ratio is Alberta's real proportions,
+                // so changing only one axis stretches the province.
+                width: 128,
+                child: AspectRatio(
+                  aspectRatio: 128 / 236,
+                  child: GestureDetector(
+                    onTap: onRadarTap,
+                    behavior: HitTestBehavior.opaque,
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        ClipPath(
+                          clipper: const _AlbertaShapeClipper(),
+                          child: _RadarPreviewCard(
+                            timelineFuture: radarFuture,
+                            location: selectedLocation,
+                          ),
                         ),
-                      ),
-                      CustomPaint(painter: const _AlbertaBorderPainter()),
-                    ],
+                        CustomPaint(painter: const _AlbertaBorderPainter()),
+                      ],
+                    ),
                   ),
                 ),
               ),
-            ),
+            ],
+          ),
+            // ADR 0001 makes multi-source side-by-side the product's
+            // differentiator. The strip was built but never mounted, so the
+            // comparison shipped invisible. It sits under the hero row at full
+            // card width so the chips can wrap instead of fighting the radar.
+            if (sources.isNotEmpty) ...[
+              const SizedBox(height: 14),
+              Divider(
+                height: 1,
+                thickness: 1,
+                color: Colors.white.withValues(alpha: 0.15),
+              ),
+              const SizedBox(height: 12),
+              _SourceComparisonStrip(sources: sources),
+            ],
           ],
         ),
       ),
@@ -1392,6 +1651,188 @@ class _SourceComparisonStrip extends StatelessWidget {
   }
 }
 
+/// ECCC severe-weather alerts.
+///
+/// ADR 0005 sets a passive posture: this widget owns layout, typography and
+/// severity colour, and nothing else. The alert text is ECCC's, rendered whole.
+/// It is never paraphrased, condensed, or ellipsised, because the moment we
+/// reword a tornado warning we take on interpretive liability for a life-safety
+/// message. Long alerts get a scrollable body rather than a shortened one.
+class _AlertsStrip extends StatelessWidget {
+  const _AlertsStrip({required this.alerts});
+
+  final List<dynamic> alerts;
+
+  @override
+  Widget build(BuildContext context) {
+    final cards = alerts
+        .whereType<Map<String, dynamic>>()
+        .map((alert) => _AlertCard(alert: alert))
+        .toList();
+    if (cards.isEmpty) return const SizedBox.shrink();
+
+    return Column(
+      children: [
+        for (var i = 0; i < cards.length; i++) ...[
+          if (i > 0) const SizedBox(height: 8),
+          cards[i],
+        ],
+      ],
+    );
+  }
+}
+
+class _AlertCard extends StatefulWidget {
+  const _AlertCard({required this.alert});
+
+  final Map<String, dynamic> alert;
+
+  @override
+  State<_AlertCard> createState() => _AlertCardState();
+}
+
+class _AlertCardState extends State<_AlertCard> {
+  bool _expanded = false;
+
+  /// ECCC publishes its own risk colour. Using it keeps severity presentation
+  /// consistent with WeatherCAN and every other official channel, rather than
+  /// inventing a second severity language.
+  Color _riskColour(String raw) {
+    switch (raw.trim().toLowerCase()) {
+      case 'red':
+        return const Color(0xFFC62828);
+      case 'orange':
+        return const Color(0xFFE65100);
+      case 'yellow':
+        return const Color(0xFFF9A825);
+      case 'grey':
+      case 'gray':
+        return const Color(0xFF546E7A);
+      default:
+        return const Color(0xFF546E7A);
+    }
+  }
+
+  String _expiryLabel(Object? raw) {
+    if (raw is! String || raw.trim().isEmpty) return '';
+    final parsed = DateTime.tryParse(raw);
+    if (parsed == null) return '';
+    final local = parsed.toLocal();
+    String two(int v) => v.toString().padLeft(2, '0');
+    return 'Until ${two(local.hour)}:${two(local.minute)}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final alert = widget.alert;
+
+    final name = '${alert['name'] ?? ''}'.trim();
+    final region = '${alert['region'] ?? ''}'.trim();
+    final text = '${alert['text'] ?? ''}'.trim();
+    final colour = _riskColour('${alert['risk_colour'] ?? ''}');
+    final expiry = _expiryLabel(alert['expires_at']);
+    final hasBody = text.isNotEmpty;
+
+    return Semantics(
+      liveRegion: true,
+      container: true,
+      label: 'Weather alert: $name${region.isEmpty ? '' : ', $region'}',
+      child: Material(
+        color: colour,
+        borderRadius: BorderRadius.circular(14),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(14),
+          onTap: hasBody ? () => setState(() => _expanded = !_expanded) : null,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Icon(
+                      Icons.warning_amber_rounded,
+                      color: Colors.white,
+                      size: 22,
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            // ECCC's own wording, capitalisation included.
+                            name,
+                            style: theme.textTheme.titleSmall?.copyWith(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          if (region.isNotEmpty)
+                            Text(
+                              region,
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color: Colors.white70,
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                    if (expiry.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(left: 8),
+                        child: Text(
+                          expiry,
+                          style: theme.textTheme.labelSmall?.copyWith(
+                            color: Colors.white70,
+                          ),
+                        ),
+                      ),
+                    if (hasBody)
+                      Icon(
+                        _expanded
+                            ? Icons.expand_less_rounded
+                            : Icons.expand_more_rounded,
+                        color: Colors.white70,
+                        size: 20,
+                      ),
+                  ],
+                ),
+                if (_expanded && hasBody) ...[
+                  const SizedBox(height: 10),
+                  // ECCC alert bodies run long and must not be truncated, so
+                  // the card caps its height and scrolls instead.
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 260),
+                    child: SingleChildScrollView(
+                      child: Text(
+                        text,
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: Colors.white,
+                          height: 1.35,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Issued by Environment and Climate Change Canada',
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: Colors.white60,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _RadarPreviewCard extends StatelessWidget {
   const _RadarPreviewCard({
     required this.timelineFuture,
@@ -1435,12 +1876,11 @@ class _RadarPreviewCard extends StatelessWidget {
                       'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
                   userAgentPackageName: 'ca.alberta.weather',
                 ),
-                TileLayer(
-                  urlTemplate: snapshot.data!.latestOrNull!.tileUrlTemplate(),
-                  // RainViewer radar tiles only exist up to z7; above that the
-                  // server returns a "Zoom Level Not Supported" placeholder, so
-                  // cap native fetch at 7 and let flutter_map upscale.
-                  maxNativeZoom: 7,
+                // Static newest frame; no cross-dissolve needed in the
+                // preview, so it paints instantly rather than fading in.
+                _radarTileLayer(
+                  snapshot.data!.latestOrNull!,
+                  tileDisplay: const TileDisplay.instantaneous(),
                 ),
               ],
             );
@@ -1595,18 +2035,41 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
   Timer? _timer;
   int _frameIndex = 0;
   bool _playing = false;
-  // Total frames in the loop; kept in sync by build() and read by the timer.
-  int _loopFrameCount = 1;
+
+  /// The resolved timeline.
+  ///
+  /// This is held in state rather than read out of a FutureBuilder snapshot
+  /// inside build(). The previous version wrote the frame count from build()
+  /// and read it from the playback timer, so a rebuild landing between two
+  /// ticks could advance the index against a stale count.
+  _RadarTimeline? _timeline;
+  bool _resolving = true;
+
+  List<_RadarFrame> get _frames => _timeline?.frames ?? const [];
 
   @override
   void initState() {
     super.initState();
-    // Auto-play the loop as soon as the frames are ready.
-    widget.timelineFuture.then((timeline) {
-      if (mounted && timeline.frames.length > 1) {
-        _startPlaying();
-      }
-    });
+    widget.timelineFuture
+        .then((timeline) {
+          if (!mounted) return;
+          setState(() {
+            _timeline = timeline;
+            _resolving = false;
+            _frameIndex = timeline.frames.isEmpty
+                ? 0
+                : timeline.frames.length - 1;
+          });
+          // Auto-play the loop as soon as the frames are ready.
+          if (timeline.frames.length > 1) _startPlaying();
+        })
+        .catchError((Object _) {
+          if (!mounted) return;
+          setState(() {
+            _timeline = const _RadarTimeline(frames: []);
+            _resolving = false;
+          });
+        });
   }
 
   @override
@@ -1617,14 +2080,13 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
 
   void _startPlaying() {
     _timer?.cancel();
+    if (_frames.length < 2) return;
     setState(() => _playing = true);
     _timer = Timer.periodic(const Duration(milliseconds: 800), (_) {
       if (!mounted) return;
-      setState(() {
-        _frameIndex = _loopFrameCount > 0
-            ? (_frameIndex + 1) % _loopFrameCount
-            : 0;
-      });
+      final count = _frames.length;
+      if (count < 2) return;
+      setState(() => _frameIndex = (_frameIndex + 1) % count);
     });
   }
 
@@ -1648,14 +2110,13 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
         color: Color(0xFF071F45),
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
-      child: FutureBuilder<_RadarTimeline>(
-        future: widget.timelineFuture,
-        builder: (context, snapshot) {
-          if (!snapshot.hasData) {
+      child: Builder(
+        builder: (context) {
+          if (_resolving) {
             return const Center(child: CircularProgressIndicator());
           }
 
-          final frames = snapshot.data!.frames;
+          final frames = _frames;
           if (frames.isEmpty) {
             return const Center(
               child: Text(
@@ -1664,15 +2125,11 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
               ),
             );
           }
-          _loopFrameCount = frames.length;
           if (_frameIndex >= frames.length) {
             _frameIndex = frames.length - 1;
           }
           final frame = frames[_frameIndex];
-          final dt = DateTime.fromMillisecondsSinceEpoch(
-            frame.unixTime * 1000,
-            isUtc: true,
-          ).toLocal();
+          final dt = frame.utc.toLocal();
 
           return Column(
             children: [
@@ -1751,14 +2208,10 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
                       maxNativeZoom: 19,
                       userAgentPackageName: 'ca.alberta.weather',
                     ),
-                    TileLayer(
-                      urlTemplate: frame.tileUrlTemplate(),
-                      // RainViewer radar tiles only exist up to z7; above that the
-                      // server returns a "Zoom Level Not Supported" placeholder, so
-                      // cap native fetch at 7 and let flutter_map upscale.
-                      maxNativeZoom: 7,
-                      // Cross-dissolve each frame into the next so the loop reads
-                      // smoothly instead of hard-cutting between 10-min steps.
+                    // Cross-dissolve each frame into the next so the loop reads
+                    // smoothly instead of hard-cutting between steps.
+                    _radarTileLayer(
+                      frame,
                       tileDisplay: const TileDisplay.fadeIn(
                         duration: Duration(milliseconds: 500),
                       ),
@@ -1774,8 +2227,24 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
                   ],
                 ),
               ),
+              // ECCC requires attribution on GeoMet data. It sits on the radar
+              // surface itself, not in the portfolio footer, which is a
+              // separate commercial element under Ad-Free.
               Padding(
-                padding: const EdgeInsets.fromLTRB(10, 8, 10, 16),
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    _timeline?.attribution ?? _radarAttribution,
+                    style: const TextStyle(
+                      color: Colors.white38,
+                      fontSize: 11,
+                    ),
+                  ),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(10, 4, 10, 16),
                 child: Row(
                   children: [
                     IconButton(

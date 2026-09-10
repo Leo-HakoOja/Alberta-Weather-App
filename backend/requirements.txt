@@ -1,2 +1,5 @@
 fastapi>=0.116.0,<1.0.0
 uvicorn[standard]>=0.35.0,<1.0.0
+# WeatherKit REST API requires an ES256-signed JWT per request.
+# The crypto extra pulls in `cryptography` for ECDSA; Python has no stdlib option.
+PyJWT[crypto]>=2.13.0,<3.0.0

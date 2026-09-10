@@ -99,6 +99,32 @@ class SourceForecast(BaseModel):
     error: str | None = None
 
 
+class WeatherAlert(BaseModel):
+    """An ECCC severe-weather alert, carried verbatim.
+
+    ADR 0005 sets a passive posture: the app controls layout, typography and
+    severity colour, but never the substantive text. Every field here is
+    ECCC's own wording.
+    """
+
+    id: str | None = None
+    alert_code: str | None = None
+    alert_type: str | None = None
+    name: str
+    short_name: str | None = None
+    text: str | None = None
+    risk_colour: str | None = None
+    confidence: str | None = None
+    impact: str | None = None
+    region: str | None = None
+    province: str | None = None
+    status: str | None = None
+    published_at: str | None = None
+    expires_at: str | None = None
+    effective_at: str | None = None
+    event_ends_at: str | None = None
+
+
 class WeatherResponse(BaseModel):
     location: Location
     units: UnitsBySection
@@ -108,6 +134,7 @@ class WeatherResponse(BaseModel):
     daily_14d_extended: list[DailyForecastItem]
     dayparts_14d: list[DaypartsForecastItem]
     sources: list[SourceForecast] = []
+    alerts: list[WeatherAlert] = []
     schema_version: str
     generated_at: str
     source: str

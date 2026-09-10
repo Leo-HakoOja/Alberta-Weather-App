@@ -555,7 +555,8 @@ def normalize_forecast_response(data: dict, location: dict) -> dict:
                 "daily_7d": daily_items[:7],
             },
         ],
-        "schema_version": "1.1.0",
+        "alerts": [],
+        "schema_version": "1.2.0",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": "open-meteo.com",
     }
@@ -591,6 +592,51 @@ def _append_eccc_source(response: dict, location: dict) -> dict:
     return response
 
 
+def _append_weatherkit_source(response: dict, location: dict) -> dict:
+    """Add Apple WeatherKit as the third parallel source (ADR 0009).
+
+    Never raises: WeatherKit failing degrades the comparison to two sources rather
+    than taking the forecast down, same posture as the ECCC source.
+    """
+    from .weatherkit_service import SOURCE_ID, fetch_weatherkit_source
+
+    try:
+        source = fetch_weatherkit_source(
+            float(location.get("latitude", 0.0)),
+            float(location.get("longitude", 0.0)),
+            str(location.get("timezone") or "America/Edmonton"),
+        )
+    except Exception as err:  # noqa: BLE001 - a source must never break the response
+        source = {
+            "source_id": SOURCE_ID,
+            "source_name": "Apple Weather",
+            "attribution_url": "https://weatherkit.apple.com/attribution/en-CA",
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "current": None,
+            "hourly_next_24h": [],
+            "daily_7d": [],
+            "error": f"Unhandled WeatherKit error: {err}",
+        }
+    response["sources"].append(source)
+    return response
+
+
+def _append_alerts(response: dict, location: dict) -> dict:
+    """Attach active ECCC alerts for this location.
+
+    ADR 0005 treats alerts as life-safety, but a failed alert fetch must not
+    take the forecast down with it, so this degrades to an empty list rather
+    than raising. Imported lazily to match the ECCC source above.
+    """
+    from .alerts_service import fetch_alerts_safe
+
+    response["alerts"] = fetch_alerts_safe(
+        float(location.get("latitude", 0.0)),
+        float(location.get("longitude", 0.0)),
+    )
+    return response
+
+
 def get_weather(latitude: float, longitude: float, timezone: str = "auto") -> dict:
     request = ForecastRequest(latitude=latitude, longitude=longitude, timezone=timezone)
     raw = fetch_open_meteo_forecast(request)
@@ -600,7 +646,9 @@ def get_weather(latitude: float, longitude: float, timezone: str = "auto") -> di
         "timezone": raw.get("timezone", timezone),
     }
     response = normalize_forecast_response(raw, location)
-    return _append_eccc_source(response, location)
+    response = _append_eccc_source(response, location)
+    response = _append_weatherkit_source(response, location)
+    return _append_alerts(response, location)
 
 
 def get_myrnam_weather() -> dict:
@@ -611,4 +659,6 @@ def get_myrnam_weather() -> dict:
     )
     raw = fetch_open_meteo_forecast(request)
     response = normalize_forecast_response(raw, MYRNAM)
-    return _append_eccc_source(response, MYRNAM)
+    response = _append_eccc_source(response, MYRNAM)
+    response = _append_weatherkit_source(response, MYRNAM)
+    return _append_alerts(response, MYRNAM)
