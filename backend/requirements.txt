@@ -3,3 +3,7 @@ uvicorn[standard]>=0.35.0,<1.0.0
 # WeatherKit REST API requires an ES256-signed JWT per request.
 # The crypto extra pulls in `cryptography` for ECDSA; Python has no stdlib option.
 PyJWT[crypto]>=2.13.0,<3.0.0
+# Radar grids (ADR 0010): numpy for the grid maths and motion estimation,
+# Pillow to read GeoMet's PNG and GeoTIFF responses.
+numpy>=2.0,<3
+Pillow>=11,<13
