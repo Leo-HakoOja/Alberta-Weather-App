@@ -27,7 +27,9 @@ const _geometRadarLayer = 'RADAR_1KM_RRAI';
 /// Discrete 14-colour ramp. The discrete styles encode to roughly a third the
 /// bytes of the continuous ones (~7 KB vs ~23 KB per tile) for the same
 /// coverage, which matters across a 31-frame loop on cellular.
-const _geometRadarStyle = 'Radar-Rain_Dis-14colors';
+// TEST BUILD ONLY: continuous ramp to compare against the discrete look.
+// Do not merge; see branch test/radar-continuous-style.
+const _geometRadarStyle = 'Radar-Rain_14colors';
 
 /// ECCC HRDPS instantaneous precipitation rate (2.5 km model), for forecast
 /// mode. Deliberately not `HRDPS.CONTINENTAL_PR`: that layer is run-total
