@@ -43,6 +43,65 @@ const _forecastAttribution = 'Forecast: ECCC HRDPS model, not observed radar';
 const _radarAttribution = 'Radar: ECCC GeoMet';
 const _radarAttributionFallback = 'Radar: RainViewer (ECCC unavailable)';
 
+/// Natural Resources Canada's Canada Base Map (Transportation), Web Mercator.
+///
+/// Replaced CARTO, which began watermarking keyless tiles "API KEY REQUIRED" in
+/// late August 2026. NRCan needs no key, is free under the Open Government
+/// Licence - Canada, and publishes geometry and labels as separate layers, so
+/// town names can still sit above the radar. It covers Canada only; south of
+/// the 49th the tiles are blank and the dark filter renders them as plain
+/// background. ArcGIS tile order is {z}/{y}/{x}.
+const _nrcanBaseUrl =
+    'https://maps-cartes.services.geo.ca/server2_serveur2/rest/services/'
+    'BaseMaps/CBMT_CBCT_GEOM_3857/MapServer/tile/{z}/{y}/{x}';
+const _nrcanLabelsUrl =
+    'https://maps-cartes.services.geo.ca/server2_serveur2/rest/services/'
+    'BaseMaps/CBMT_TXT_3857/MapServer/tile/{z}/{y}/{x}';
+
+/// Required by the Open Government Licence - Canada, in its own wording.
+const _basemapAttribution =
+    'Basemap © Natural Resources Canada. Contains information licensed under '
+    'the Open Government Licence – Canada.';
+
+/// NRCan's map is light. Greyscale it, invert the luminance and dim it, so it
+/// reads as a neutral dark map under the radar. A plain colour invert (what
+/// flutter_map's darkModeTileBuilder does) turns every lake and river orange.
+const _basemapDarkFilter = ColorFilter.matrix(<double>[
+  -0.16445, -0.32285, -0.0627, 0, 152.25, //
+  -0.16445, -0.32285, -0.0627, 0, 152.25, //
+  -0.16445, -0.32285, -0.0627, 0, 152.25, //
+  0, 0, 0, 1, 0, //
+]);
+
+/// Labels: greyscale and invert, so dark text turns light and its light halo
+/// turns dark. Not dimmed, so names stay readable over the radar.
+const _labelsDarkFilter = ColorFilter.matrix(<double>[
+  -0.299, -0.587, -0.114, 0, 255, //
+  -0.299, -0.587, -0.114, 0, 255, //
+  -0.299, -0.587, -0.114, 0, 255, //
+  0, 0, 0, 1, 0, //
+]);
+
+/// The NRCan base geometry, darkened.
+///
+/// Filtered per tile through `tileBuilder`: flutter_map 7.0.2 exposes no
+/// layer-wide container hook on TileLayer, and at the 20 to 30 tiles on
+/// screen the per-tile cost is negligible.
+Widget _basemapLayer() => TileLayer(
+  urlTemplate: _nrcanBaseUrl,
+  userAgentPackageName: 'ca.alberta.weather',
+  tileBuilder: (context, tile, _) =>
+      ColorFiltered(colorFilter: _basemapDarkFilter, child: tile),
+);
+
+/// NRCan place names and highway shields, painted above the radar.
+Widget _basemapLabelsLayer() => TileLayer(
+  urlTemplate: _nrcanLabelsUrl,
+  userAgentPackageName: 'ca.alberta.weather',
+  tileBuilder: (context, tile, _) =>
+      ColorFiltered(colorFilter: _labelsDarkFilter, child: tile),
+);
+
 /// Upper bound on frames in one loop.
 ///
 /// Flutter's default ImageCache holds 1000 images. A full-viewport radar loop
@@ -1957,17 +2016,14 @@ class _RadarPreviewCard extends StatelessWidget {
                 ),
               ),
               children: [
-                TileLayer(
-                  urlTemplate:
-                      'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
-                  userAgentPackageName: 'ca.alberta.weather',
-                ),
+                _basemapLayer(),
                 // Static newest frame; no cross-dissolve needed in the
                 // preview, so it paints instantly rather than fading in.
                 _radarTileLayer(
                   snapshot.data!.latestOrNull!,
                   tileDisplay: const TileDisplay.instantaneous(),
                 ),
+                _basemapLabelsLayer(),
               ],
             );
           },
@@ -2472,13 +2528,7 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
                     children: [
                       // Base map without labels, so town names and highways
                       // can sit on top of the radar instead of under it.
-                      TileLayer(
-                        urlTemplate:
-                            'https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}.png',
-                        subdomains: const ['a', 'b', 'c'],
-                        maxNativeZoom: 19,
-                        userAgentPackageName: 'ca.alberta.weather',
-                      ),
+                      _basemapLayer(),
                       // Cross-dissolve each frame into the next so the loop
                       // reads smoothly instead of hard-cutting between steps.
                       _radarTileLayer(
@@ -2488,13 +2538,7 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
                         ),
                       ),
                       // Labels (town names, highways) painted above the radar.
-                      TileLayer(
-                        urlTemplate:
-                            'https://{s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}.png',
-                        subdomains: const ['a', 'b', 'c'],
-                        maxNativeZoom: 19,
-                        userAgentPackageName: 'ca.alberta.weather',
-                      ),
+                      _basemapLabelsLayer(),
                     ],
                   ),
           ),
@@ -2507,7 +2551,8 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
               child: Align(
                 alignment: Alignment.centerLeft,
                 child: Text(
-                  _active?.attribution ?? _radarAttribution,
+                  '${_active?.attribution ?? _radarAttribution}. '
+                  '$_basemapAttribution',
                   style: const TextStyle(color: Colors.white38, fontSize: 11),
                 ),
               ),

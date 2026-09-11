@@ -43,10 +43,36 @@ keeps `maxNativeZoom: 7` and upscales above that. Its ~30 min nowcast is gone: t
 feed returned zero nowcast frames as of 2026-09-10, so the only predictive radar is
 the HRDPS forecast mode. The radar sheet says which source is live.
 
-## Base map
+## Base map: Natural Resources Canada (since 2026-09-11)
 
-CARTO dark tiles, split so labels paint above the radar:
-`dark_nolabels` under, `dark_only_labels` over. The hero preview uses `dark_all`.
+Canada Base Map (Transportation), Web Mercator, from NRCan's ArcGIS tile service
+(`maps-cartes.services.geo.ca/.../BaseMaps/...`, tile order `{z}/{y}/{x}`):
+
+- `CBMT_CBCT_GEOM_3857`: roads, water, borders, no text (JPEG). Drawn under the radar.
+- `CBMT_TXT_3857`: English labels only, transparent PNG. Drawn over the radar.
+
+Free with no key under the Open Government Licence - Canada. The licence requires the
+statement "Contains information licensed under the Open Government Licence – Canada"
+(shown on the radar sheet) and forbids implying government endorsement or using
+government logos. Zoom 0 to 23. Covers Canada only: south of the 49th the tiles are
+blank, which the dark filter renders as plain background.
+
+The map is light, so the app darkens it with a `ColorFilter.matrix`: greyscale,
+invert luminance, dim to 55% (labels: greyscale and invert, not dimmed). A plain
+colour invert (flutter_map's `darkModeTileBuilder`) was tried and rejected: it turns
+every lake and river orange.
+
+**Why not the alternatives:**
+
+- **CARTO** (the original basemap) started watermarking keyless tiles "API KEY
+  REQUIRED" in late August 2026. Its key signup did not work for a Canadian
+  operator (only a two-week platform trial was offered).
+- **Apple Maps** has no tile feed a third-party renderer like flutter_map can use.
+  Switching would mean replacing the map engine, and it would be iOS only.
+- **Google Map Tiles API** works with flutter_map but is billed past 100k tiles a
+  month, capped at 15k tiles a day, and needs session tokens.
+- **Esri's** dark basemap loaded without a key, but Esri's current docs require one,
+  so that endpoint could close the same way CARTO's did.
 
 ## Resource strategy
 
