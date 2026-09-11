@@ -12,36 +12,12 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart';
 
-/// Which service a radar frame is fetched from.
-///
-/// ADR 0004 makes ECCC GeoMet the single radar source and RainViewer a fallback
-/// used only when GeoMet is unreachable. Both shapes are kept because they are
-/// fetched completely differently: GeoMet is a WMS that renders on demand and
-/// wants an exact timestamp, RainViewer is a static tile CDN keyed by path.
-enum _RadarSource { geomet, rainviewer }
+import 'radar_engine.dart';
+import 'radar_store.dart';
 
-/// ECCC GeoMet, precipitation rate for rain, 1 km composite.
-const _geometBaseUrl = 'https://geo.weather.gc.ca/geomet?';
-const _geometRadarLayer = 'RADAR_1KM_RRAI';
-
-/// Discrete 14-colour ramp. The discrete styles encode to roughly a third the
-/// bytes of the continuous ones (~7 KB vs ~23 KB per tile) for the same
-/// coverage, which matters across a 31-frame loop on cellular.
-const _geometRadarStyle = 'Radar-Rain_Dis-14colors';
-
-/// ECCC HRDPS instantaneous precipitation rate (2.5 km model), for forecast
-/// mode. Deliberately not `HRDPS.CONTINENTAL_PR`: that layer is run-total
-/// accumulation, so a loop of it only ever fills. See ADR 0008.
-const _geometForecastLayer = 'HRDPS.CONTINENTAL_RT';
-const _geometForecastStyle = 'PRECIPPRTMMH';
-
-/// Hours of model forecast in the loop. 24 keeps a full-viewport loop inside
-/// Flutter's default ImageCache; 48 would evict and re-fetch on every pass.
-const _forecastHorizonHours = 24;
+/// ECCC requires attribution on GeoMet data, on the radar surface itself.
+const _radarAttribution = 'Radar: ECCC';
 const _forecastAttribution = 'Forecast: ECCC HRDPS model, not observed radar';
-
-const _radarAttribution = 'Radar: ECCC GeoMet';
-const _radarAttributionFallback = 'Radar: RainViewer (ECCC unavailable)';
 
 /// Natural Resources Canada's Canada Base Map (Transportation), Web Mercator.
 ///
@@ -101,211 +77,6 @@ Widget _basemapLabelsLayer() => TileLayer(
   tileBuilder: (context, tile, _) =>
       ColorFiltered(colorFilter: _labelsDarkFilter, child: tile),
 );
-
-/// Upper bound on frames in one loop.
-///
-/// Flutter's default ImageCache holds 1000 images. A full-viewport radar loop
-/// evicts well before that, so the loop is capped to keep the second pass
-/// through the animation from re-fetching every frame.
-const _maxRadarFrames = 40;
-
-/// Parses the subset of ISO 8601 durations GeoMet uses for a time step
-/// (`PT6M`, `PT1H`). Returns null for anything else rather than guessing.
-/// Formats an instant the way GeoMet's time dimension expects it.
-///
-/// Second-precision, always UTC, no sub-second part. `DateTime.toIso8601String`
-/// emits milliseconds, which GeoMet rejects.
-@visibleForTesting
-String formatGeoMetTime(DateTime instant) {
-  final t = instant.toUtc();
-  String two(int v) => v.toString().padLeft(2, '0');
-  return '${t.year.toString().padLeft(4, '0')}-${two(t.month)}-${two(t.day)}'
-      'T${two(t.hour)}:${two(t.minute)}:${two(t.second)}Z';
-}
-
-@visibleForTesting
-Duration? parseIso8601Period(String value) {
-  final match = RegExp(
-    r'^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$',
-  ).firstMatch(value.trim());
-  if (match == null) return null;
-  final h = int.tryParse(match.group(1) ?? '0') ?? 0;
-  final m = int.tryParse(match.group(2) ?? '0') ?? 0;
-  final sec = int.tryParse(match.group(3) ?? '0') ?? 0;
-  if (h == 0 && m == 0 && sec == 0) return null;
-  return Duration(hours: h, minutes: m, seconds: sec);
-}
-
-/// The time extent GeoMet advertises for [layer], or null.
-///
-/// A filtered GetCapabilities response still includes the parent group layers,
-/// each carrying its own time dimension, so the first `<Dimension name="time">`
-/// in the document is not necessarily this layer's. The search starts at the
-/// layer's own `<Name>` element.
-@visibleForTesting
-String? geoMetTimeExtentForLayer(String capabilitiesXml, String layer) {
-  final at = capabilitiesXml.indexOf('<Name>$layer</Name>');
-  if (at < 0) return null;
-  final match = RegExp(
-    r'<Dimension name="time"[^>]*>([^<]+)</Dimension>',
-  ).firstMatch(capabilitiesXml.substring(at));
-  return match?.group(1)?.trim();
-}
-
-/// Parses a GeoMet `start/end/period` extent. Null for anything malformed.
-@visibleForTesting
-({DateTime start, DateTime end, Duration step})? parseGeoMetExtent(
-  String? extent,
-) {
-  if (extent == null) return null;
-  final parts = extent.trim().split('/');
-  if (parts.length != 3) return null;
-  final start = DateTime.tryParse(parts[0])?.toUtc();
-  final end = DateTime.tryParse(parts[1])?.toUtc();
-  final step = parseIso8601Period(parts[2]);
-  if (start == null || end == null || step == null || step.inSeconds <= 0) {
-    return null;
-  }
-  if (end.isBefore(start)) return null;
-  return (start: start, end: end, step: step);
-}
-
-/// The forecast frames worth showing: the model's own steps from the current
-/// hour onward, capped at [horizon].
-///
-/// Frame instants always come from the advertised extent, never from the
-/// device clock, because GeoMet matches the `time` parameter exactly.
-@visibleForTesting
-List<DateTime> forecastFrameTimes({
-  required DateTime start,
-  required DateTime end,
-  required Duration step,
-  required DateTime now,
-  int horizon = _forecastHorizonHours,
-}) {
-  final utcNow = now.toUtc();
-  final currentHour = DateTime.utc(
-    utcNow.year,
-    utcNow.month,
-    utcNow.day,
-    utcNow.hour,
-  );
-  final frames = <DateTime>[];
-  for (
-    var t = start.toUtc();
-    !t.isAfter(end) && frames.length < horizon;
-    t = t.add(step)
-  ) {
-    if (t.isBefore(currentHour)) continue;
-    frames.add(t);
-  }
-  return frames;
-}
-
-class _RadarFrame {
-  const _RadarFrame({
-    required this.source,
-    required this.unixTime,
-    this.path,
-    this.forecast = false,
-    this.geometLayer = _geometRadarLayer,
-    this.geometStyle = _geometRadarStyle,
-    this.modelled = false,
-  });
-
-  final _RadarSource source;
-  final int unixTime;
-
-  /// GeoMet layer and style this frame is drawn from. Observed radar and the
-  /// model forecast are different WMS layers with different colour ramps.
-  final String geometLayer;
-  final String geometStyle;
-
-  /// True for ECCC model forecast frames (ADR 0008): computed by HRDPS, not
-  /// measured by a radar. Separate from [forecast], which marks RainViewer's
-  /// short nowcast tail, so the two are never confused.
-  final bool modelled;
-
-  /// RainViewer tile path. Null for GeoMet frames, which address a frame by
-  /// timestamp rather than by path.
-  final String? path;
-
-  /// True for RainViewer nowcast frames (predicted, ~30 min ahead) as opposed
-  /// to observed past radar.
-  final bool forecast;
-
-  DateTime get utc =>
-      DateTime.fromMillisecondsSinceEpoch(unixTime * 1000, isUtc: true);
-
-  /// The exact instant string GeoMet's time dimension expects.
-  ///
-  /// The layer advertises `nearestValue="0"`, so the server matches the
-  /// requested time exactly instead of snapping to the closest frame. A value
-  /// that is off by a second returns nothing, which is why frame times are
-  /// generated from the advertised extent rather than from the device clock.
-  String get geometTime => formatGeoMetTime(utc);
-
-  String rainviewerUrlTemplate() {
-    return 'https://tilecache.rainviewer.com$path/256/{z}/{x}/{y}/6/1_1.png';
-  }
-}
-
-class _RadarTimeline {
-  const _RadarTimeline({
-    required this.frames,
-    this.source = _RadarSource.geomet,
-    this.modelled = false,
-  });
-
-  final List<_RadarFrame> frames;
-  final _RadarSource source;
-
-  /// True for the HRDPS forecast loop.
-  final bool modelled;
-
-  _RadarFrame? get latestOrNull => frames.isEmpty ? null : frames.last;
-
-  bool get isEmpty => frames.isEmpty;
-
-  String get attribution {
-    if (modelled) return _forecastAttribution;
-    return source == _RadarSource.geomet
-        ? _radarAttribution
-        : _radarAttributionFallback;
-  }
-}
-
-/// Builds the tile layer for one radar frame.
-///
-/// GeoMet needs no `maxNativeZoom` cap: it renders each tile on request at
-/// whatever zoom is asked for. The cap exists only on the RainViewer fallback,
-/// whose tiles stop at z7.
-Widget _radarTileLayer(_RadarFrame frame, {TileDisplay? tileDisplay}) {
-  if (frame.source == _RadarSource.geomet) {
-    return TileLayer(
-      wmsOptions: WMSTileLayerOptions(
-        baseUrl: _geometBaseUrl,
-        layers: [frame.geometLayer],
-        styles: [frame.geometStyle],
-        version: '1.3.0',
-        format: 'image/png',
-        transparent: true,
-        otherParameters: {'time': frame.geometTime},
-      ),
-      userAgentPackageName: 'ca.alberta.weather',
-      tileDisplay: tileDisplay ?? const TileDisplay.fadeIn(),
-    );
-  }
-  return TileLayer(
-    urlTemplate: frame.rainviewerUrlTemplate(),
-    // RainViewer radar tiles only exist up to z7; above that the server
-    // returns a "Zoom Level Not Supported" placeholder, so cap native fetch
-    // at 7 and let flutter_map upscale.
-    maxNativeZoom: 7,
-    userAgentPackageName: 'ca.alberta.weather',
-    tileDisplay: tileDisplay ?? const TileDisplay.fadeIn(),
-  );
-}
 
 class _SavedLocation {
   const _SavedLocation({
@@ -404,7 +175,14 @@ bool _isAlbertaPlace(Map<String, dynamic> item, double lat, double lon) {
 }
 
 
+/// Started before anything else, so radar-ready is measured from launch.
+final Stopwatch _launchClock = Stopwatch()..start();
+
+/// Codemagic's build counter, passed in with --dart-define. Empty locally.
+const _buildNumber = String.fromEnvironment('BUILD_NUMBER');
+
 void main() {
+  _launchClock.elapsed; // touch: top-level finals initialise lazily
   runApp(const WeatherApp());
 }
 
@@ -457,7 +235,7 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
   );
 
   late Future<Map<String, dynamic>> _weatherFuture;
-  late Future<_RadarTimeline> _radarFuture;
+  late final RadarStore _radar;
   late List<_SavedLocation> _savedLocations;
   late _SavedLocation _selectedLocation;
   _SavedLocation? _baseLocation;
@@ -469,10 +247,22 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
     _savedLocations = [..._defaultSavedLocations];
     _selectedLocation = _edmonton;
     _weatherFuture = _fetchWeather();
-    _radarFuture = _fetchRadarTimeline().catchError(
-      (_) => const _RadarTimeline(frames: []),
+    // Prefetch the whole radar window in the background from launch, so the
+    // sheet opens onto frames already held (ADR 0010).
+    _radar = RadarStore(
+      apiBase: _apiOrigin(),
+      launchClock: _launchClock,
+      build: _buildNumber.isEmpty ? null : _buildNumber,
     );
+    _radar.start();
+    _radar.refreshWarnings();
     _initLocation();
+  }
+
+  @override
+  void dispose() {
+    _radar.dispose();
+    super.dispose();
   }
 
   // Opens on the operator's chosen base Location if one was saved. Otherwise
@@ -540,6 +330,17 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
     return configured.replace(host: webHost).toString();
   }
 
+  /// Backend origin for the radar endpoints, from the same configured URL.
+  Uri _apiOrigin() {
+    final api = Uri.parse(_resolvedApiUrl());
+    return Uri(
+      scheme: api.scheme,
+      host: api.host,
+      port: api.hasPort ? api.port : null,
+      path: '/',
+    );
+  }
+
   String _urlForSelectedLocation() {
     final configured = Uri.parse(_resolvedApiUrl());
 
@@ -574,127 +375,11 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
     return decoded;
   }
 
-  /// ADR 0004: ECCC GeoMet is the radar source, RainViewer is the fallback.
-  Future<_RadarTimeline> _fetchRadarTimeline() async {
-    try {
-      return await _fetchGeoMetTimeline();
-    } catch (_) {
-      // GeoMet is a render-on-demand government service; when it is down or
-      // slow the app still has to show radar, so fall through rather than
-      // surfacing an error the user can do nothing about.
-      return await _fetchRainViewerTimeline();
-    }
-  }
-
-  /// Expands GeoMet's advertised time dimension into concrete frames.
-  ///
-  /// GeoMet publishes an ISO 8601 interval (`start/end/period`) rather than a
-  /// frame list, so the frames are generated locally. This is also why the
-  /// whole capabilities document is fetched only once per refresh instead of
-  /// per frame.
-  Future<_RadarTimeline> _fetchGeoMetTimeline() async {
-    final response = await http
-        .get(
-          Uri.parse(
-            '${_geometBaseUrl}service=WMS&version=1.3.0'
-            '&request=GetCapabilities&LAYERS=$_geometRadarLayer',
-          ),
-        )
-        .timeout(const Duration(seconds: 12));
-    if (response.statusCode != 200) {
-      throw Exception('GeoMet unavailable (${response.statusCode})');
-    }
-
-    final extent = parseGeoMetExtent(
-      geoMetTimeExtentForLayer(response.body, _geometRadarLayer),
-    );
-    if (extent == null) {
-      throw Exception('Unparseable GeoMet time extent');
-    }
-
-    final all = <_RadarFrame>[];
-    for (var t = extent.start; !t.isAfter(extent.end); t = t.add(extent.step)) {
-      all.add(
-        _RadarFrame(
-          source: _RadarSource.geomet,
-          unixTime: t.millisecondsSinceEpoch ~/ 1000,
-        ),
-      );
-    }
-    // If the window ever outgrows the cap, keep the newest frames: the oldest
-    // radar is the least useful.
-    final frames = all.length > _maxRadarFrames
-        ? all.sublist(all.length - _maxRadarFrames)
-        : all;
-
-    if (frames.isEmpty) {
-      throw Exception('No GeoMet radar frames available');
-    }
-    return _RadarTimeline(frames: frames, source: _RadarSource.geomet);
-  }
-
-  Future<_RadarTimeline> _fetchRainViewerTimeline() async {
-    final response = await http.get(
-      Uri.parse('https://api.rainviewer.com/public/weather-maps.json'),
-    );
-    if (response.statusCode != 200) {
-      throw Exception('Radar source unavailable (${response.statusCode})');
-    }
-
-    final decoded = jsonDecode(response.body);
-    if (decoded is! Map<String, dynamic>) {
-      throw Exception('Unexpected radar response');
-    }
-
-    final radar = decoded['radar'] as Map<String, dynamic>? ?? const {};
-    final past = radar['past'] as List<dynamic>? ?? const [];
-    final nowcast = radar['nowcast'] as List<dynamic>? ?? const [];
-
-    List<_RadarFrame> parseFrames(
-      List<dynamic> source, {
-      bool forecast = false,
-    }) {
-      return source
-          .whereType<Map<String, dynamic>>()
-          .map((item) {
-            final path = item['path'];
-            final time = item['time'];
-            if (path is! String || time is! int) {
-              return null;
-            }
-            return _RadarFrame(
-              source: _RadarSource.rainviewer,
-              path: path,
-              unixTime: time,
-              forecast: forecast,
-            );
-          })
-          .whereType<_RadarFrame>()
-          .toList();
-    }
-
-    // Observed past radar, then RainViewer's short nowcast (predicted ~30 min)
-    // so the loop plays straight through into the near future.
-    final frames = [
-      ...parseFrames(past),
-      ...parseFrames(nowcast, forecast: true),
-    ]..sort((a, b) => a.unixTime.compareTo(b.unixTime));
-
-    if (frames.isEmpty) {
-      throw Exception('No radar frames available');
-    }
-
-    return _RadarTimeline(frames: frames, source: _RadarSource.rainviewer);
-  }
-
-
   Future<void> _refresh() async {
     setState(() {
       _weatherFuture = _fetchWeather();
-      _radarFuture = _fetchRadarTimeline().catchError(
-        (_) => const _RadarTimeline(frames: []),
-      );
     });
+    _radar.start();
     await _weatherFuture;
   }
 
@@ -970,7 +655,7 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
         return FractionallySizedBox(
           heightFactor: 0.92,
           child: _RadarViewerSheet(
-            timelineFuture: _radarFuture,
+            radar: _radar,
             location: _selectedLocation,
           ),
         );
@@ -1143,7 +828,7 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
                         daily7: daily7,
                         daily14: daily14,
                       ),
-                      radarFuture: _radarFuture,
+                      radar: _radar,
                       onRadarTap: _openRadarViewer,
                       sources: sources,
                     ),
@@ -1551,7 +1236,7 @@ class _HeroCurrentCard extends StatelessWidget {
     required this.current,
     required this.selectedLocation,
     required this.todayForecast,
-    required this.radarFuture,
+    required this.radar,
     required this.onRadarTap,
     required this.sources,
   });
@@ -1560,7 +1245,7 @@ class _HeroCurrentCard extends StatelessWidget {
   final Map<String, dynamic> current;
   final _SavedLocation selectedLocation;
   final Map<String, dynamic>? todayForecast;
-  final Future<_RadarTimeline> radarFuture;
+  final RadarStore radar;
   final VoidCallback onRadarTap;
   final List<dynamic> sources;
 
@@ -1631,7 +1316,7 @@ class _HeroCurrentCard extends StatelessWidget {
                         ),
                         const SizedBox(width: 10),
                         Text(
-                          '${_fmt(current['temperature'])}°C',
+                          '${_fmt(meanLiveTemperature(sources) ?? current['temperature'])}°C',
                           style: theme.textTheme.displaySmall?.copyWith(
                             fontWeight: FontWeight.w700,
                             height: 1,
@@ -1694,10 +1379,7 @@ class _HeroCurrentCard extends StatelessWidget {
                       children: [
                         ClipPath(
                           clipper: const _AlbertaShapeClipper(),
-                          child: _RadarPreviewCard(
-                            timelineFuture: radarFuture,
-                            location: selectedLocation,
-                          ),
+                          child: _RadarPreviewCard(radar: radar),
                         ),
                         CustomPaint(painter: const _AlbertaBorderPainter()),
                       ],
@@ -1707,20 +1389,6 @@ class _HeroCurrentCard extends StatelessWidget {
               ),
             ],
           ),
-            // ADR 0001 makes multi-source side-by-side the product's
-            // differentiator. The strip was built but never mounted, so the
-            // comparison shipped invisible. It sits under the hero row at full
-            // card width so the chips can wrap instead of fighting the radar.
-            if (sources.isNotEmpty) ...[
-              const SizedBox(height: 14),
-              Divider(
-                height: 1,
-                thickness: 1,
-                color: Colors.white.withValues(alpha: 0.15),
-              ),
-              const SizedBox(height: 12),
-              _SourceComparisonStrip(sources: sources),
-            ],
           ],
         ),
       ),
@@ -1728,72 +1396,25 @@ class _HeroCurrentCard extends StatelessWidget {
   }
 }
 
-class _SourceComparisonStrip extends StatelessWidget {
-  const _SourceComparisonStrip({required this.sources});
-
-  final List<dynamic> sources;
-
-  static const Map<String, String> _shortLabels = {
-    'open-meteo': 'Open-Meteo',
-    'eccc': 'ECCC',
-    'apple-weatherkit': 'WeatherKit',
-  };
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final chips = <Widget>[];
-    for (final raw in sources) {
-      if (raw is! Map) continue;
-      final source = raw.cast<String, dynamic>();
-      final id = '${source['source_id'] ?? ''}';
-      final label = _shortLabels[id] ?? id;
-      final current = source['current'] as Map<String, dynamic>?;
-      final temp = current?['temperature'];
-      final error = source['error'];
-      final tempText = (temp is num) ? '${temp.toStringAsFixed(0)}°' : '—';
-
-      chips.add(
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-          decoration: BoxDecoration(
-            color: error == null
-                ? Colors.white.withValues(alpha: 0.18)
-                : Colors.white.withValues(alpha: 0.08),
-            borderRadius: BorderRadius.circular(999),
-            border: Border.all(
-              color: Colors.white.withValues(alpha: 0.25),
-              width: 0.5,
-            ),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                label,
-                style: theme.textTheme.labelSmall?.copyWith(
-                  color: Colors.white70,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-              const SizedBox(width: 6),
-              Text(
-                error == null ? tempText : '—',
-                style: theme.textTheme.labelMedium?.copyWith(
-                  color: Colors.white,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ],
-          ),
-        ),
-      );
-    }
-
-    if (chips.isEmpty) return const SizedBox.shrink();
-
-    return Wrap(spacing: 6, runSpacing: 6, children: chips);
+/// The hero temperature: the mean of every source that answered with one.
+///
+/// Per-source temperatures stay in the response (ADR 0001 keeps all three in
+/// the data layer) but are no longer rendered; the card shows one number.
+/// A source is live when it reported no error and a numeric current
+/// temperature. Null when none did, so the caller can fall back.
+@visibleForTesting
+double? meanLiveTemperature(List<dynamic> sources) {
+  final temps = <double>[];
+  for (final raw in sources) {
+    if (raw is! Map) continue;
+    if (raw['error'] != null) continue;
+    final current = raw['current'];
+    if (current is! Map) continue;
+    final temp = current['temperature'];
+    if (temp is num && temp.isFinite) temps.add(temp.toDouble());
   }
+  if (temps.isEmpty) return null;
+  return temps.reduce((a, b) => a + b) / temps.length;
 }
 
 /// ECCC severe-weather alerts.
@@ -1978,56 +1599,96 @@ class _AlertCardState extends State<_AlertCard> {
   }
 }
 
-class _RadarPreviewCard extends StatelessWidget {
-  const _RadarPreviewCard({
-    required this.timelineFuture,
-    required this.location,
-  });
+/// The hero card's Alberta cutout: the newest real radar scan, still.
+class _RadarPreviewCard extends StatefulWidget {
+  const _RadarPreviewCard({required this.radar});
 
-  final Future<_RadarTimeline> timelineFuture;
-  final _SavedLocation location;
+  final RadarStore radar;
+
+  @override
+  State<_RadarPreviewCard> createState() => _RadarPreviewCardState();
+}
+
+class _RadarPreviewCardState extends State<_RadarPreviewCard> {
+  ui.Image? _image;
+  String? _shownKey;
+  String? _pendingKey;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.radar.addListener(_update);
+    _update();
+  }
+
+  @override
+  void dispose() {
+    widget.radar.removeListener(_update);
+    _image?.dispose();
+    super.dispose();
+  }
+
+  void _update() {
+    final latest = widget.radar.latestObserved;
+    final renderer = widget.radar.renderer;
+    if (latest == null || renderer == null) return;
+    final key = latest.cacheKey;
+    if (key == _shownKey || key == _pendingKey) return;
+    _pendingKey = key;
+    final grid = renderer.grid;
+    renderer
+        .render(aKey: key)
+        .then((rgba) => _imageFromRgba(rgba, grid.width, grid.height))
+        .then((image) {
+          if (!mounted || _pendingKey != key) {
+            image.dispose();
+            return;
+          }
+          setState(() {
+            _image?.dispose();
+            _image = image;
+            _shownKey = key;
+          });
+        })
+        .catchError((Object _) {})
+        .whenComplete(() {
+          if (_pendingKey == key) _pendingKey = null;
+        });
+  }
 
   @override
   Widget build(BuildContext context) {
+    final grid = widget.radar.renderer?.grid;
+    final image = _image;
     return Stack(
       fit: StackFit.expand,
       children: [
-        FutureBuilder<_RadarTimeline>(
-          future: timelineFuture,
-          builder: (context, snapshot) {
-            if (!snapshot.hasData || snapshot.data!.latestOrNull == null) {
-              return Container(
-                color: Colors.black.withValues(alpha: 0.25),
-                alignment: Alignment.center,
-                child: const Icon(Icons.radar, color: Colors.white70, size: 36),
-              );
-            }
-            return FlutterMap(
-              options: MapOptions(
-                initialCameraFit: CameraFit.bounds(
-                  bounds: LatLngBounds(
-                    const LatLng(48.9, -120.1),
-                    const LatLng(60.1, -109.9),
-                  ),
-                  padding: const EdgeInsets.all(4),
+        if (image == null || grid == null)
+          Container(
+            color: Colors.black.withValues(alpha: 0.25),
+            alignment: Alignment.center,
+            child: const Icon(Icons.radar, color: Colors.white70, size: 36),
+          )
+        else
+          FlutterMap(
+            options: MapOptions(
+              initialCameraFit: CameraFit.bounds(
+                bounds: LatLngBounds(
+                  const LatLng(48.9, -120.1),
+                  const LatLng(60.1, -109.9),
                 ),
-                interactionOptions: const InteractionOptions(
-                  flags: InteractiveFlag.none,
-                ),
+                padding: const EdgeInsets.all(4),
               ),
-              children: [
-                _basemapLayer(),
-                // Static newest frame; no cross-dissolve needed in the
-                // preview, so it paints instantly rather than fading in.
-                _radarTileLayer(
-                  snapshot.data!.latestOrNull!,
-                  tileDisplay: const TileDisplay.instantaneous(),
-                ),
-                _basemapLabelsLayer(),
-              ],
-            );
-          },
-        ),
+              interactionOptions: const InteractionOptions(
+                flags: InteractiveFlag.none,
+              ),
+            ),
+            children: [
+              _basemapLayer(),
+              _RadarGridLayer(image: image, grid: grid),
+              _basemapLabelsLayer(),
+            ],
+          ),
         DecoratedBox(
           decoration: BoxDecoration(
             gradient: RadialGradient(
@@ -2063,6 +1724,73 @@ class _RadarPreviewCard extends StatelessWidget {
       ],
     );
   }
+}
+
+Future<ui.Image> _imageFromRgba(Uint8List rgba, int width, int height) {
+  final completer = Completer<ui.Image>();
+  ui.decodeImageFromPixels(
+    rgba,
+    width,
+    height,
+    ui.PixelFormat.rgba8888,
+    completer.complete,
+  );
+  return completer.future;
+}
+
+/// One radar frame, drawn on the device and pinned to the map.
+///
+/// The grid is linear in Web Mercator, the map's own projection, so the image
+/// only has to be stretched between its two projected corners to sit on its
+/// ground position at every zoom and pan. Wrapped the way flutter_map's own
+/// layers are, so rotation follows too.
+class _RadarGridLayer extends StatelessWidget {
+  const _RadarGridLayer({required this.image, required this.grid});
+
+  final ui.Image? image;
+  final RadarGridSpec grid;
+
+  @override
+  Widget build(BuildContext context) {
+    final image = this.image;
+    if (image == null) return const SizedBox.shrink();
+    final camera = MapCamera.of(context);
+    final nw = camera.project(grid.northWest) - camera.pixelOrigin;
+    final se = camera.project(grid.southEast) - camera.pixelOrigin;
+    return MobileLayerTransformer(
+      child: SizedBox.expand(
+        child: CustomPaint(
+          painter: _RadarImagePainter(
+            image,
+            Rect.fromLTRB(nw.x, nw.y, se.x, se.y),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _RadarImagePainter extends CustomPainter {
+  const _RadarImagePainter(this.image, this.dst);
+
+  final ui.Image image;
+  final Rect dst;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.drawImageRect(
+      image,
+      Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble()),
+      dst,
+      // Bilinear only smooths the drawing of each grid cell on screen. Frame
+      // values are never touched by it.
+      Paint()..filterQuality = FilterQuality.low,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_RadarImagePainter old) =>
+      old.image != image || old.dst != dst;
 }
 
 // 49-point simplified Alberta border derived from Natural Earth 1:10m data
@@ -2160,139 +1888,89 @@ class _AlbertaBorderPainter extends CustomPainter {
   bool shouldRepaint(_AlbertaBorderPainter old) => false;
 }
 
-/// The model forecast loop from ECCC HRDPS (ADR 0008).
-///
-/// There is no fallback: RainViewer no longer publishes a nowcast, and nothing
-/// else free covers Alberta hours ahead. When GeoMet is unreachable the sheet
-/// says so rather than showing something else.
-Future<_RadarTimeline> _fetchGeoMetForecastTimeline() async {
-  final response = await http
-      .get(
-        Uri.parse(
-          '${_geometBaseUrl}service=WMS&version=1.3.0'
-          '&request=GetCapabilities&LAYERS=$_geometForecastLayer',
-        ),
-      )
-      .timeout(const Duration(seconds: 12));
-  if (response.statusCode != 200) {
-    throw Exception('GeoMet forecast unavailable (${response.statusCode})');
-  }
-
-  final extent = parseGeoMetExtent(
-    geoMetTimeExtentForLayer(response.body, _geometForecastLayer),
-  );
-  if (extent == null) {
-    throw Exception('Unparseable GeoMet forecast extent');
-  }
-
-  final times = forecastFrameTimes(
-    start: extent.start,
-    end: extent.end,
-    step: extent.step,
-    now: DateTime.now(),
-  );
-  if (times.isEmpty) {
-    throw Exception('No forecast frames ahead of now');
-  }
-
-  return _RadarTimeline(
-    source: _RadarSource.geomet,
-    modelled: true,
-    frames: [
-      for (final t in times)
-        _RadarFrame(
-          source: _RadarSource.geomet,
-          unixTime: t.millisecondsSinceEpoch ~/ 1000,
-          geometLayer: _geometForecastLayer,
-          geometStyle: _geometForecastStyle,
-          modelled: true,
-        ),
-    ],
-  );
-}
-
 class _RadarViewerSheet extends StatefulWidget {
-  const _RadarViewerSheet({
-    required this.timelineFuture,
-    required this.location,
-  });
+  const _RadarViewerSheet({required this.radar, required this.location});
 
-  final Future<_RadarTimeline> timelineFuture;
+  final RadarStore radar;
   final _SavedLocation location;
 
   @override
   State<_RadarViewerSheet> createState() => _RadarViewerSheetState();
 }
 
-enum _RadarMode { observed, forecast }
-
 class _RadarViewerSheetState extends State<_RadarViewerSheet> {
-  Timer? _timer;
-  int _frameIndex = 0;
+  final MapController _map = MapController();
+
+  /// Real frames held when the schedule was last built, oldest first.
+  List<RadarFrameRef> _real = const [];
+
+  /// Real frames plus interpolated ones: what playback steps through.
+  List<RadarDisplayFrame> _schedule = const [];
+  int _index = 0;
+
+  /// Display index of the newest observed frame, where radar hands to model.
+  int? _nowIndex;
+
   bool _playing = false;
-  _RadarMode _mode = _RadarMode.observed;
+  bool _userPaused = false;
+  int _playToken = 0;
 
-  /// The resolved observed timeline.
-  ///
-  /// Held in state rather than read out of a FutureBuilder snapshot inside
-  /// build(). An earlier version wrote the frame count from build() and read it
-  /// from the playback timer, so a rebuild landing between two ticks could
-  /// advance the index against a stale count.
-  _RadarTimeline? _observed;
-  bool _resolving = true;
+  /// Set while a tornado or severe thunderstorm warning overlaps the view, or
+  /// while warning status is unknown: real frames only, nothing interpolated.
+  bool _realOnly = false;
+  String? _realOnlyReason;
+  LatLngBounds? _view;
 
-  /// The model forecast (ADR 0008), fetched the first time forecast mode opens
-  /// and again once stale. HRDPS publishes a new run four times a day, and the
-  /// frames of a superseded run stop existing server-side, which flutter_map
-  /// would draw as blank tiles with no error.
-  _RadarTimeline? _forecast;
-  DateTime? _forecastFetchedAt;
-  bool _forecastLoading = false;
-  bool _forecastFailed = false;
+  ui.Image? _shown;
+  final Map<String, ui.Image> _images = {};
+  final Map<String, Future<ui.Image?>> _inflight = {};
+  static const _imageCacheSize = 20;
 
-  static const _forecastMaxAge = Duration(minutes: 10);
+  bool _showStats = false;
 
-  /// Where the "you are here" dot sits. Starts on the selected location so
-  /// the dot is there the moment the map paints, then moves to the device's
-  /// own fix if location is already permitted.
+  static const _interpolatedFrameDelay = Duration(milliseconds: 100);
+  static const _realFrameDelay = Duration(milliseconds: 600);
+  static const _loopHold = Duration(milliseconds: 1200);
+
   late LatLng _you = LatLng(
     widget.location.latitude,
     widget.location.longitude,
   );
 
-  _RadarTimeline? get _active =>
-      _mode == _RadarMode.forecast ? _forecast : _observed;
+  final DateTime _openedAt = DateTime.now();
 
-  List<_RadarFrame> get _frames => _active?.frames ?? const [];
+  RadarStore get _radar => widget.radar;
 
   @override
   void initState() {
     super.initState();
-    widget.timelineFuture
-        .then((timeline) {
-          if (!mounted) return;
-          setState(() {
-            _observed = timeline;
-            _resolving = false;
-            if (_mode == _RadarMode.observed) {
-              _frameIndex = timeline.frames.isEmpty
-                  ? 0
-                  : timeline.frames.length - 1;
-            }
-          });
-          // Auto-play the loop as soon as the frames are ready.
-          if (_mode == _RadarMode.observed && timeline.frames.length > 1) {
-            _startPlaying();
-          }
-        })
-        .catchError((Object _) {
-          if (!mounted) return;
-          setState(() {
-            _observed = const _RadarTimeline(frames: []);
-            _resolving = false;
-          });
-        });
+    _radar.addListener(_onRadarChanged);
+    _rebuildSchedule();
+    unawaited(_radar.refreshIfStale());
     _locateYou();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _maybeAutoplay());
+  }
+
+  @override
+  void dispose() {
+    _playToken++;
+    _radar.removeListener(_onRadarChanged);
+    _radar.flushRenderReport(displayFrames: _schedule.length);
+    for (final image in _images.values) {
+      image.dispose();
+    }
+    super.dispose();
+  }
+
+  void _onRadarChanged() {
+    if (!mounted) return;
+    setState(_rebuildSchedule);
+    _maybeAutoplay();
+  }
+
+  void _maybeAutoplay() {
+    if (!mounted || _playing || _userPaused) return;
+    if (_radar.settled && _schedule.length > 1) _startPlaying();
   }
 
   // Never prompts: permission is asked for at launch and by the location
@@ -2323,155 +2001,245 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
     }
   }
 
-  @override
-  void dispose() {
-    _timer?.cancel();
-    super.dispose();
+  String _imageKey(RadarDisplayFrame f) {
+    final a = _real[f.a].cacheKey;
+    if (f.isReal) return a;
+    return '$a|${_real[f.b].cacheKey}|${f.t.toStringAsFixed(4)}|${f.blend.name}';
+  }
+
+  /// Rebuilds the schedule from the frames held and the warning state, keeping
+  /// the playhead on the same moment.
+  void _rebuildSchedule() {
+    final radar = _radar;
+    final keepTime = _schedule.isEmpty ? null : _schedule[_index].time;
+
+    final view = _view;
+    if (!radar.warningsKnown) {
+      _realOnly = true;
+      _realOnlyReason = 'Real frames only: warning status unavailable.';
+    } else if (view != null &&
+        warningsCoverView(
+          radar.warnings,
+          south: view.south,
+          west: view.west,
+          north: view.north,
+          east: view.east,
+        )) {
+      _realOnly = true;
+      _realOnlyReason =
+          'Real frames only: tornado or severe thunderstorm warning in view.';
+    } else {
+      _realOnly = false;
+      _realOnlyReason = null;
+    }
+
+    final real = radar.frames;
+    _real = real;
+    _schedule = buildDisplaySchedule(
+      times: [for (final f in real) f.time],
+      forecast: [for (final f in real) f.forecast],
+      realOnly: _realOnly,
+      hasFlow: (i) => radar.hasFlow(real[i]),
+    );
+
+    final lastObserved = real.lastIndexWhere((f) => !f.forecast);
+    _nowIndex = lastObserved < 0
+        ? null
+        : _schedule.indexWhere((d) => d.isReal && d.a == lastObserved);
+    if (_nowIndex != null && _nowIndex! < 0) _nowIndex = null;
+
+    if (_schedule.isEmpty) {
+      _index = 0;
+    } else if (keepTime == null) {
+      _index = _nowIndex ?? 0;
+    } else {
+      var best = 0;
+      var bestGap = 1 << 62;
+      for (var i = 0; i < _schedule.length; i++) {
+        final gap = _schedule[i].time.difference(keepTime).inMilliseconds.abs();
+        if (gap < bestGap) {
+          best = i;
+          bestGap = gap;
+        }
+      }
+      _index = best;
+    }
+    if (_schedule.isNotEmpty) unawaited(_showIndex(_index));
+  }
+
+  void _onMapMoved(MapCamera camera, bool hasGesture) {
+    final bounds = camera.visibleBounds;
+    _view = bounds;
+    final wasRealOnly = _realOnly;
+    final covered = !_radar.warningsKnown ||
+        warningsCoverView(
+          _radar.warnings,
+          south: bounds.south,
+          west: bounds.west,
+          north: bounds.north,
+          east: bounds.east,
+        );
+    if (covered != wasRealOnly) setState(_rebuildSchedule);
+  }
+
+  void _onMapReady() => _onMapMoved(_map.camera, false);
+
+  Future<ui.Image?> _imageFor(int index) {
+    if (index < 0 || index >= _schedule.length) return Future.value(null);
+    final f = _schedule[index];
+    final key = _imageKey(f);
+    final cached = _images.remove(key);
+    if (cached != null) {
+      _images[key] = cached; // most recently used goes last
+      return Future.value(cached);
+    }
+    final inflight = _inflight[key];
+    if (inflight != null) return inflight;
+    final renderer = _radar.renderer;
+    if (renderer == null) return Future.value(null);
+    final grid = renderer.grid;
+    final watch = Stopwatch()..start();
+    final future = renderer
+        .render(
+          aKey: _real[f.a].cacheKey,
+          bKey: f.isReal ? null : _real[f.b].cacheKey,
+          t: f.t,
+          blend: f.blend,
+          flowKey: f.blend == RadarBlend.motion ? radarFlowKey(_real[f.a]) : null,
+        )
+        .then((rgba) => _imageFromRgba(rgba, grid.width, grid.height))
+        .then<ui.Image?>((image) {
+          _radar.reportRender(watch.elapsedMilliseconds);
+          if (!mounted) {
+            image.dispose();
+            return null;
+          }
+          _images[key] = image;
+          _evict();
+          return image;
+        })
+        .catchError((Object _) => null)
+        // A block body, not `=> _inflight.remove(key)`: that returns this very
+        // future, and whenComplete waits on a returned future, so the render
+        // would wait on itself forever.
+        .whenComplete(() {
+          _inflight.remove(key);
+        });
+    _inflight[key] = future;
+    return future;
+  }
+
+  void _evict() {
+    while (_images.length > _imageCacheSize) {
+      final oldest = _images.keys.first;
+      final image = _images.remove(oldest)!;
+      // The engine keeps a drawn image alive until its frame is done, so
+      // disposing the Dart handle here is safe even if it is on screen.
+      if (!identical(image, _shown)) image.dispose();
+    }
+  }
+
+  Future<void> _showIndex(int index) async {
+    final image = await _imageFor(index);
+    if (!mounted || image == null || _index != index) return;
+    setState(() => _shown = image);
   }
 
   void _startPlaying() {
-    _timer?.cancel();
-    if (_frames.length < 2) return;
-    setState(() => _playing = true);
-    _timer = Timer.periodic(const Duration(milliseconds: 800), (_) {
-      if (!mounted) return;
-      final count = _frames.length;
-      if (count < 2) return;
-      setState(() => _frameIndex = (_frameIndex + 1) % count);
+    if (_schedule.length < 2) return;
+    final token = ++_playToken;
+    setState(() {
+      _playing = true;
+      _userPaused = false;
     });
+    unawaited(_playLoop(token));
   }
 
-  void _stopPlaying() {
-    _timer?.cancel();
-    setState(() => _playing = false);
+  Future<void> _playLoop(int token) async {
+    while (mounted && _playing && token == _playToken) {
+      final started = DateTime.now();
+      final count = _schedule.length;
+      if (count < 2) break;
+      final next = (_index + 1) % count;
+      final image = await _imageFor(next);
+      // Start the one after while this one is on screen.
+      unawaited(_imageFor((next + 1) % count));
+      if (!mounted || !_playing || token != _playToken) return;
+      if (next >= _schedule.length) continue; // schedule changed underneath
+      setState(() {
+        _index = next;
+        if (image != null) _shown = image;
+      });
+      var delay = _schedule[next].isReal && _realOnly
+          ? _realFrameDelay
+          : _interpolatedFrameDelay;
+      if (!_realOnly && _schedule[next].isReal && _realOnlyNeighbours(next)) {
+        // A real frame with no interpolation either side (a gap too long to
+        // fill, or motion not in yet) holds like a real-only frame would.
+        delay = _realFrameDelay;
+      }
+      if (next == _schedule.length - 1) delay = _loopHold;
+      final wait = delay - DateTime.now().difference(started);
+      if (wait > Duration.zero) await Future<void>.delayed(wait);
+    }
+  }
+
+  bool _realOnlyNeighbours(int i) {
+    final before = i == 0 || _schedule[i - 1].isReal;
+    final after = i == _schedule.length - 1 || _schedule[i + 1].isReal;
+    return before && after;
+  }
+
+  void _stopPlaying({bool byUser = false}) {
+    _playToken++;
+    setState(() {
+      _playing = false;
+      if (byUser) _userPaused = true;
+    });
   }
 
   void _togglePlay() {
     if (_playing) {
-      _stopPlaying();
+      _stopPlaying(byUser: true);
     } else {
       _startPlaying();
     }
   }
 
-  void _setMode(_RadarMode mode) {
-    if (mode == _mode) return;
-    _timer?.cancel();
-    final observedCount = _observed?.frames.length ?? 0;
-    setState(() {
-      _mode = mode;
-      _playing = false;
-      // Observed opens on the newest frame, forecast on the first hour ahead.
-      _frameIndex = mode == _RadarMode.observed && observedCount > 0
-          ? observedCount - 1
-          : 0;
-    });
-
-    if (mode == _RadarMode.forecast) {
-      final fetchedAt = _forecastFetchedAt;
-      final fresh =
-          _forecast != null &&
-          fetchedAt != null &&
-          DateTime.now().difference(fetchedAt) < _forecastMaxAge;
-      if (!fresh) {
-        _loadForecast();
-        return;
-      }
-    }
-    _startPlaying();
+  void _scrubTo(int index) {
+    if (_playing) _stopPlaying(byUser: true);
+    _userPaused = true;
+    setState(() => _index = index);
+    unawaited(_showIndex(index));
   }
 
-  Future<void> _loadForecast() async {
-    setState(() {
-      _forecastLoading = true;
-      _forecastFailed = false;
-    });
-    try {
-      final timeline = await _fetchGeoMetForecastTimeline();
-      if (!mounted) return;
-      setState(() {
-        _forecast = timeline;
-        _forecastFetchedAt = DateTime.now();
-        _forecastLoading = false;
-        if (_mode == _RadarMode.forecast) _frameIndex = 0;
-      });
-      if (_mode == _RadarMode.forecast) _startPlaying();
-    } catch (_) {
-      if (!mounted) return;
-      setState(() {
-        _forecastLoading = false;
-        _forecastFailed = true;
-      });
-    }
-  }
-
-  String _frameLabel(_RadarFrame frame) {
-    final dt = frame.utc.toLocal();
+  String _frameLabel(RadarDisplayFrame frame) {
+    final dt = frame.time.toLocal();
     String two(int v) => v.toString().padLeft(2, '0');
     final clock = '${two(dt.hour)}:${two(dt.minute)}';
-    if (!frame.modelled) return clock;
-    // Hour 20 of a forecast loop is not self-evidently tomorrow, so model
-    // frames always carry the day.
+    final isForecast = _nowIndex != null && _index > _nowIndex!;
+    if (!isForecast) return clock;
+    // Hour 20 of the forecast is not self-evidently tomorrow, so model frames
+    // always carry the day.
     const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
     return '${days[dt.weekday - 1]} $clock';
   }
 
-  String get _emptyMessage {
-    if (_mode == _RadarMode.forecast) {
-      return _forecastFailed
-          ? 'Forecast radar is unavailable right now.'
-          : 'No forecast frames available.';
-    }
-    return 'Radar temporarily unavailable.';
-  }
-
-  Widget _modeToggle() {
-    return SegmentedButton<_RadarMode>(
-      segments: [
-        const ButtonSegment(
-          value: _RadarMode.observed,
-          label: Text('Observed'),
-          icon: Icon(Icons.history),
-        ),
-        ButtonSegment(
-          value: _RadarMode.forecast,
-          label: Text('Next $_forecastHorizonHours h'),
-          icon: const Icon(Icons.update),
-        ),
-      ],
-      selected: {_mode},
-      showSelectedIcon: false,
-      onSelectionChanged: (selection) => _setMode(selection.first),
-      style: ButtonStyle(
-        visualDensity: VisualDensity.compact,
-        foregroundColor: WidgetStateProperty.resolveWith(
-          (states) => states.contains(WidgetState.selected)
-              ? _albertaBlue
-              : Colors.white,
-        ),
-        backgroundColor: WidgetStateProperty.resolveWith(
-          (states) => states.contains(WidgetState.selected)
-              ? _albertaGold
-              : Colors.transparent,
-        ),
-        side: WidgetStatePropertyAll(
-          BorderSide(color: Colors.white.withValues(alpha: 0.35)),
-        ),
-      ),
-    );
+  /// Hours from when the sheet opened, for the scrubber's edge labels.
+  String _relativeLabel(DateTime t) {
+    final hours = (t.difference(_openedAt).inMinutes / 60).round();
+    if (hours == 0) return 'now';
+    return hours > 0 ? '+$hours h' : '$hours h';
   }
 
   @override
   Widget build(BuildContext context) {
-    final loading = _mode == _RadarMode.forecast
-        ? _forecastLoading
-        : _resolving;
-    final frames = _frames;
-    if (frames.isNotEmpty && _frameIndex >= frames.length) {
-      _frameIndex = frames.length - 1;
-    }
-    final frame = (loading || frames.isEmpty) ? null : frames[_frameIndex];
-    final modelled = frame != null && (frame.forecast || frame.modelled);
+    final radar = _radar;
+    final schedule = _schedule;
+    final grid = radar.renderer?.grid;
+    final frame = schedule.isEmpty ? null : schedule[_index];
+    final forecast = frame != null && _nowIndex != null && _index > _nowIndex!;
+    final hasFrames = frame != null && grid != null;
 
     return Container(
       decoration: const BoxDecoration(
@@ -2489,70 +2257,91 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
               borderRadius: BorderRadius.circular(2),
             ),
           ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-            child: Row(
-              children: [
-                const Icon(Icons.radar, color: Colors.white),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    'Radar • ${widget.location.name}, ${widget.location.province}',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.w700,
-                      fontSize: 16,
-                    ),
-                  ),
-                ),
-                if (modelled) ...[
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 8,
-                      vertical: 3,
-                    ),
-                    decoration: BoxDecoration(
-                      color: _albertaGold,
-                      borderRadius: BorderRadius.circular(999),
-                    ),
-                    child: const Text(
-                      'FORECAST',
-                      style: TextStyle(
-                        color: _albertaBlue,
-                        fontWeight: FontWeight.w800,
-                        fontSize: 11,
-                        letterSpacing: 0.5,
+          GestureDetector(
+            // Load and render timings, for reading off a TestFlight run.
+            onLongPress: () => setState(() => _showStats = !_showStats),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+              child: Row(
+                children: [
+                  const Icon(Icons.radar, color: Colors.white),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Radar • ${widget.location.name}, ${widget.location.province}',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w700,
+                        fontSize: 16,
                       ),
                     ),
                   ),
-                  const SizedBox(width: 8),
-                ],
-                if (frame != null)
-                  Text(
-                    _frameLabel(frame),
-                    style: const TextStyle(color: Colors.white70),
-                  ),
-              ],
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: _modeToggle(),
-            ),
-          ),
-          Expanded(
-            child: loading
-                ? const Center(child: CircularProgressIndicator())
-                : frame == null
-                ? Center(
-                    child: Text(
-                      _emptyMessage,
+                  if (forecast) ...[
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 3,
+                      ),
+                      decoration: BoxDecoration(
+                        color: _albertaGold,
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                      child: const Text(
+                        'FORECAST',
+                        style: TextStyle(
+                          color: _albertaBlue,
+                          fontWeight: FontWeight.w800,
+                          fontSize: 11,
+                          letterSpacing: 0.5,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                  ],
+                  if (frame != null)
+                    Text(
+                      _frameLabel(frame),
                       style: const TextStyle(color: Colors.white70),
                     ),
+                ],
+              ),
+            ),
+          ),
+          if (_showStats)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+              child: Text(
+                '${radar.metrics.summary()} '
+                'Build ${_buildNumber.isEmpty ? 'local' : _buildNumber}. '
+                '${schedule.length} display frames.',
+                style: const TextStyle(color: Colors.white54, fontSize: 11),
+              ),
+            ),
+          Expanded(
+            child: !hasFrames
+                ? Center(
+                    child: radar.settled
+                        ? const Text(
+                            'Radar temporarily unavailable.',
+                            style: TextStyle(color: Colors.white70),
+                          )
+                        : Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const CircularProgressIndicator(),
+                              const SizedBox(height: 12),
+                              Text(
+                                radar.wantedFrames == 0
+                                    ? 'Loading radar'
+                                    : 'Loading radar: ${radar.frames.length} '
+                                          'of ${radar.wantedFrames} frames',
+                                style: const TextStyle(color: Colors.white70),
+                              ),
+                            ],
+                          ),
                   )
                 : FlutterMap(
+                    mapController: _map,
                     options: MapOptions(
                       initialCenter: LatLng(
                         widget.location.latitude,
@@ -2561,19 +2350,14 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
                       initialZoom: 8,
                       minZoom: 4,
                       maxZoom: 11,
+                      onPositionChanged: _onMapMoved,
+                      onMapReady: _onMapReady,
                     ),
                     children: [
                       // Base map without labels, so town names and highways
                       // can sit on top of the radar instead of under it.
                       _basemapLayer(),
-                      // Cross-dissolve each frame into the next so the loop
-                      // reads smoothly instead of hard-cutting between steps.
-                      _radarTileLayer(
-                        frame,
-                        tileDisplay: const TileDisplay.fadeIn(
-                          duration: Duration(milliseconds: 500),
-                        ),
-                      ),
+                      _RadarGridLayer(image: _shown, grid: grid),
                       // Labels (town names, highways) painted above the radar.
                       _basemapLabelsLayer(),
                       MarkerLayer(
@@ -2589,23 +2373,38 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
                     ],
                   ),
           ),
-          if (frame != null) ...[
-            // ECCC requires attribution on GeoMet data. It sits on the radar
-            // surface itself, not in the portfolio footer, which is a
-            // separate commercial element under Ad-Free.
+          if (hasFrames) ...[
             Padding(
-              padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
+              padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
               child: Align(
                 alignment: Alignment.centerLeft,
                 child: Text(
-                  '${_active?.attribution ?? _radarAttribution}. '
+                  [
+                    ?_realOnlyReason,
+                    if (!_playing && !frame.isReal)
+                      'Between real frames: interpolated.',
+                    if (radar.manifest?.errors['forecast'] != null)
+                      'Forecast unavailable right now.',
+                  ].join(' '),
+                  style: const TextStyle(color: Colors.white70, fontSize: 11),
+                ),
+              ),
+            ),
+            // ECCC requires attribution on its data. It sits on the radar
+            // surface itself, not in the portfolio footer.
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 2, 16, 0),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  '${forecast ? _forecastAttribution : _radarAttribution}. '
                   '$_basemapAttribution',
                   style: const TextStyle(color: Colors.white38, fontSize: 11),
                 ),
               ),
             ),
             Padding(
-              padding: const EdgeInsets.fromLTRB(10, 4, 10, 16),
+              padding: const EdgeInsets.fromLTRB(10, 4, 16, 16),
               child: Row(
                 children: [
                   IconButton(
@@ -2616,20 +2415,19 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
                       size: 34,
                     ),
                   ),
+                  const SizedBox(width: 6),
                   Expanded(
-                    child: Slider(
-                      value: _frameIndex.toDouble(),
-                      min: 0,
-                      max: (frames.length - 1).toDouble(),
-                      divisions: frames.length > 1 ? frames.length - 1 : 1,
-                      activeColor: _albertaGold,
-                      onChanged: (value) {
-                        _timer?.cancel();
-                        setState(() {
-                          _playing = false;
-                          _frameIndex = value.round();
-                        });
-                      },
+                    child: _RadarScrubber(
+                      count: schedule.length,
+                      index: _index,
+                      nowIndex: _nowIndex,
+                      onChanged: _scrubTo,
+                      startLabel: _nowIndex == 0
+                          ? null
+                          : _relativeLabel(schedule.first.time),
+                      endLabel: _nowIndex == schedule.length - 1
+                          ? null
+                          : _relativeLabel(schedule.last.time),
                     ),
                   ),
                 ],
@@ -2641,6 +2439,175 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
       ),
     );
   }
+}
+
+/// The radar timeline scrubber: one track, observed radar left of the "Now"
+/// marker and model forecast right of it.
+///
+/// Spaced by frame, not by clock time. Observed frames are 6 minutes apart and
+/// forecast frames an hour apart, so a clock-true track would squeeze the two
+/// observed hours into the first 8% of the width and the playhead would crawl
+/// through them then leap. The edge labels carry the actual span instead.
+class _RadarScrubber extends StatelessWidget {
+  const _RadarScrubber({
+    required this.count,
+    required this.index,
+    required this.nowIndex,
+    required this.onChanged,
+    this.startLabel,
+    this.endLabel,
+  });
+
+  final int count;
+  final int index;
+  final int? nowIndex;
+  final ValueChanged<int> onChanged;
+  final String? startLabel;
+  final String? endLabel;
+
+  static const double _inset = 10;
+
+  int _indexAt(double dx, double width) {
+    if (count < 2) return 0;
+    final usable = width - 2 * _inset;
+    final t = ((dx - _inset) / usable).clamp(0.0, 1.0);
+    return (t * (count - 1)).round();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    const labelStyle = TextStyle(color: Colors.white54, fontSize: 10);
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
+        void scrub(double dx) {
+          final i = _indexAt(dx, width);
+          if (i != index) onChanged(i);
+        }
+
+        return Semantics(
+          slider: true,
+          label: 'Radar timeline',
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTapDown: (d) => scrub(d.localPosition.dx),
+            onHorizontalDragStart: (d) => scrub(d.localPosition.dx),
+            onHorizontalDragUpdate: (d) => scrub(d.localPosition.dx),
+            child: SizedBox(
+              height: 46,
+              child: Stack(
+                children: [
+                  Positioned.fill(
+                    child: CustomPaint(
+                      painter: _RadarScrubberPainter(
+                        count: count,
+                        index: index,
+                        nowIndex: nowIndex,
+                        inset: _inset,
+                      ),
+                    ),
+                  ),
+                  if (startLabel != null)
+                    Positioned(
+                      left: 0,
+                      bottom: 0,
+                      child: Text(startLabel!, style: labelStyle),
+                    ),
+                  if (endLabel != null)
+                    Positioned(
+                      right: 0,
+                      bottom: 0,
+                      child: Text(endLabel!, style: labelStyle),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _RadarScrubberPainter extends CustomPainter {
+  const _RadarScrubberPainter({
+    required this.count,
+    required this.index,
+    required this.nowIndex,
+    required this.inset,
+  });
+
+  final int count;
+  final int index;
+  final int? nowIndex;
+  final double inset;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final usable = size.width - 2 * inset;
+    double xOf(int i) =>
+        count < 2 ? size.width / 2 : inset + usable * i / (count - 1);
+    final y = size.height / 2;
+    final track = Paint()
+      ..strokeWidth = 4
+      ..strokeCap = StrokeCap.round;
+
+    final nowX = nowIndex == null ? inset : xOf(nowIndex!);
+    // Observed: measured radar, drawn white.
+    if (nowIndex != null) {
+      canvas.drawLine(
+        Offset(inset, y),
+        Offset(nowX, y),
+        track..color = Colors.white.withValues(alpha: 0.55),
+      );
+    }
+    // Forecast: the model, drawn in the same gold as the FORECAST badge.
+    if (nowIndex == null || nowIndex! < count - 1) {
+      canvas.drawLine(
+        Offset(nowX, y),
+        Offset(size.width - inset, y),
+        track..color = _albertaGold.withValues(alpha: 0.55),
+      );
+    }
+
+    if (nowIndex != null) {
+      canvas.drawLine(
+        Offset(nowX, y - 11),
+        Offset(nowX, y + 11),
+        Paint()
+          ..color = Colors.white
+          ..strokeWidth = 2,
+      );
+      final label = TextPainter(
+        text: const TextSpan(
+          text: 'Now',
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: 10,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      final lx = (nowX - label.width / 2).clamp(0.0, size.width - label.width);
+      label.paint(canvas, Offset(lx, y - 13 - label.height));
+    }
+
+    final thumbX = xOf(index.clamp(0, count < 1 ? 0 : count - 1));
+    canvas.drawCircle(Offset(thumbX, y), 8, Paint()..color = _albertaBlue);
+    canvas.drawCircle(
+      Offset(thumbX, y),
+      6,
+      Paint()
+        ..color = (nowIndex != null && index > nowIndex!)
+            ? _albertaGold
+            : Colors.white,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_RadarScrubberPainter old) =>
+      old.count != count || old.index != index || old.nowIndex != nowIndex;
 }
 
 /// Yellow dot with a dark ring, so it reads over both the dark basemap and
