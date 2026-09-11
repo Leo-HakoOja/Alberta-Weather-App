@@ -29,7 +29,9 @@
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>Alberta Weather uses your location once to show weather for the Alberta location nearest you.</string>
+	<string>Alberta Weather uses your location while the app is open to show weather where you are and mark you on the radar map.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Alberta Weather only uses your location while the app is open, to show weather where you are and mark you on the radar map. It never tracks you in the background.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

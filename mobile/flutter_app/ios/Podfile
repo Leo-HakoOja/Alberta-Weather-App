@@ -41,10 +41,10 @@ post_install do |installer|
   installer.pods_project.targets.each do |target|
     flutter_additional_ios_build_settings(target)
 
-    # The app only ever asks for when-in-use location. Compiling out
-    # geolocator's requestAlwaysAuthorization call stops App Store Connect
-    # flagging a missing NSLocationAlwaysAndWhenInUseUsageDescription
-    # (ITMS-90683) for a permission the app never requests.
+    # The app only ever asks for when-in-use location, so compile out
+    # geolocator's requestAlwaysAuthorization call. This alone did NOT stop
+    # App Store Connect's ITMS-90683 warning (build 38); Info.plist also
+    # carries NSLocationAlwaysAndWhenInUseUsageDescription for that.
     if target.name == 'geolocator_apple'
       target.build_configurations.each do |config|
         defs = Array(config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] || '$(inherited)')
