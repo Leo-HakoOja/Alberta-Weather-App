@@ -1,5 +1,10 @@
 # Radar migrates to ECCC GeoMet and gains a forecast mode
 
+> **Superseded in part by [ADR 0010](0010-on-device-radar.md) (2026-09-11):** the
+> two-mode toggle is gone (one continuous timeline with a "Now" marker), radar is
+> drawn on the device rather than from GeoMet tiles, and RainViewer is removed. The
+> source choices below (`RADAR_1KM_RRAI`, `HRDPS.CONTINENTAL_RT`, never `_PR`) stand.
+
 > **Status:** Both halves are **built**. GeoMet observed migration shipped
 > 2026-09-10 (`RADAR_1KM_RRAI` primary, RainViewer fallback, exact-match timestamps
 > pinned by `test/radar_test.dart`). Forecast mode was first deferred to v1.1, then

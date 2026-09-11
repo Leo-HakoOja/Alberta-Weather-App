@@ -59,7 +59,8 @@ workflows:
           flutter build ipa \
             --release \
             --build-number=$BUILD_NUMBER \
-            --dart-define=WEATHER_API_URL=$WEATHER_API_URL
+            --dart-define=WEATHER_API_URL=$WEATHER_API_URL \
+            --dart-define=BUILD_NUMBER=$BUILD_NUMBER
 
     artifacts:
       - mobile/flutter_app/build/ios/ipa/*.ipa
