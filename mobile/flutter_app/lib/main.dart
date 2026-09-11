@@ -2252,6 +2252,14 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
 
   static const _forecastMaxAge = Duration(minutes: 10);
 
+  /// Where the "you are here" dot sits. Starts on the selected location so
+  /// the dot is there the moment the map paints, then moves to the device's
+  /// own fix if location is already permitted.
+  late LatLng _you = LatLng(
+    widget.location.latitude,
+    widget.location.longitude,
+  );
+
   _RadarTimeline? get _active =>
       _mode == _RadarMode.forecast ? _forecast : _observed;
 
@@ -2284,6 +2292,35 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
             _resolving = false;
           });
         });
+    _locateYou();
+  }
+
+  // Never prompts: permission is asked for at launch and by the location
+  // button. Opening the radar should not throw up a dialog.
+  Future<void> _locateYou() async {
+    try {
+      if (!await Geolocator.isLocationServiceEnabled()) return;
+      final permission = await Geolocator.checkPermission();
+      if (permission != LocationPermission.whileInUse &&
+          permission != LocationPermission.always) {
+        return;
+      }
+      // Last known is instant on a phone; web has no such thing.
+      final last = kIsWeb ? null : await Geolocator.getLastKnownPosition();
+      if (last != null && mounted) {
+        setState(() => _you = LatLng(last.latitude, last.longitude));
+      }
+      final fix = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          timeLimit: Duration(seconds: 10),
+        ),
+      );
+      if (mounted) {
+        setState(() => _you = LatLng(fix.latitude, fix.longitude));
+      }
+    } catch (_) {
+      // No fix: the dot stays on the selected location.
+    }
   }
 
   @override
@@ -2539,6 +2576,16 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
                       ),
                       // Labels (town names, highways) painted above the radar.
                       _basemapLabelsLayer(),
+                      MarkerLayer(
+                        markers: [
+                          Marker(
+                            point: _you,
+                            width: 18,
+                            height: 18,
+                            child: const _YouAreHereDot(),
+                          ),
+                        ],
+                      ),
                     ],
                   ),
           ),
@@ -2590,6 +2637,29 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
             ),
           ] else
             const SizedBox(height: 24),
+        ],
+      ),
+    );
+  }
+}
+
+/// Yellow dot with a dark ring, so it reads over both the dark basemap and
+/// bright radar returns.
+class _YouAreHereDot extends StatelessWidget {
+  const _YouAreHereDot();
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: _albertaGold,
+        shape: BoxShape.circle,
+        border: Border.all(color: Colors.black87, width: 2),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.5),
+            blurRadius: 4,
+          ),
         ],
       ),
     );
