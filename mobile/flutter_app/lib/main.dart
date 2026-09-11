@@ -29,8 +29,78 @@ const _geometRadarLayer = 'RADAR_1KM_RRAI';
 /// coverage, which matters across a 31-frame loop on cellular.
 const _geometRadarStyle = 'Radar-Rain_Dis-14colors';
 
+/// ECCC HRDPS instantaneous precipitation rate (2.5 km model), for forecast
+/// mode. Deliberately not `HRDPS.CONTINENTAL_PR`: that layer is run-total
+/// accumulation, so a loop of it only ever fills. See ADR 0008.
+const _geometForecastLayer = 'HRDPS.CONTINENTAL_RT';
+const _geometForecastStyle = 'PRECIPPRTMMH';
+
+/// Hours of model forecast in the loop. 24 keeps a full-viewport loop inside
+/// Flutter's default ImageCache; 48 would evict and re-fetch on every pass.
+const _forecastHorizonHours = 24;
+const _forecastAttribution = 'Forecast: ECCC HRDPS model, not observed radar';
+
 const _radarAttribution = 'Radar: ECCC GeoMet';
 const _radarAttributionFallback = 'Radar: RainViewer (ECCC unavailable)';
+
+/// Natural Resources Canada's Canada Base Map (Transportation), Web Mercator.
+///
+/// Replaced CARTO, which began watermarking keyless tiles "API KEY REQUIRED" in
+/// late August 2026. NRCan needs no key, is free under the Open Government
+/// Licence - Canada, and publishes geometry and labels as separate layers, so
+/// town names can still sit above the radar. It covers Canada only; south of
+/// the 49th the tiles are blank and the dark filter renders them as plain
+/// background. ArcGIS tile order is {z}/{y}/{x}.
+const _nrcanBaseUrl =
+    'https://maps-cartes.services.geo.ca/server2_serveur2/rest/services/'
+    'BaseMaps/CBMT_CBCT_GEOM_3857/MapServer/tile/{z}/{y}/{x}';
+const _nrcanLabelsUrl =
+    'https://maps-cartes.services.geo.ca/server2_serveur2/rest/services/'
+    'BaseMaps/CBMT_TXT_3857/MapServer/tile/{z}/{y}/{x}';
+
+/// Required by the Open Government Licence - Canada, in its own wording.
+const _basemapAttribution =
+    'Basemap © Natural Resources Canada. Contains information licensed under '
+    'the Open Government Licence – Canada.';
+
+/// NRCan's map is light. Greyscale it, invert the luminance and dim it, so it
+/// reads as a neutral dark map under the radar. A plain colour invert (what
+/// flutter_map's darkModeTileBuilder does) turns every lake and river orange.
+const _basemapDarkFilter = ColorFilter.matrix(<double>[
+  -0.16445, -0.32285, -0.0627, 0, 152.25, //
+  -0.16445, -0.32285, -0.0627, 0, 152.25, //
+  -0.16445, -0.32285, -0.0627, 0, 152.25, //
+  0, 0, 0, 1, 0, //
+]);
+
+/// Labels: greyscale and invert, so dark text turns light and its light halo
+/// turns dark. Not dimmed, so names stay readable over the radar.
+const _labelsDarkFilter = ColorFilter.matrix(<double>[
+  -0.299, -0.587, -0.114, 0, 255, //
+  -0.299, -0.587, -0.114, 0, 255, //
+  -0.299, -0.587, -0.114, 0, 255, //
+  0, 0, 0, 1, 0, //
+]);
+
+/// The NRCan base geometry, darkened.
+///
+/// Filtered per tile through `tileBuilder`: flutter_map 7.0.2 exposes no
+/// layer-wide container hook on TileLayer, and at the 20 to 30 tiles on
+/// screen the per-tile cost is negligible.
+Widget _basemapLayer() => TileLayer(
+  urlTemplate: _nrcanBaseUrl,
+  userAgentPackageName: 'ca.alberta.weather',
+  tileBuilder: (context, tile, _) =>
+      ColorFiltered(colorFilter: _basemapDarkFilter, child: tile),
+);
+
+/// NRCan place names and highway shields, painted above the radar.
+Widget _basemapLabelsLayer() => TileLayer(
+  urlTemplate: _nrcanLabelsUrl,
+  userAgentPackageName: 'ca.alberta.weather',
+  tileBuilder: (context, tile, _) =>
+      ColorFiltered(colorFilter: _labelsDarkFilter, child: tile),
+);
 
 /// Upper bound on frames in one loop.
 ///
@@ -66,16 +136,95 @@ Duration? parseIso8601Period(String value) {
   return Duration(hours: h, minutes: m, seconds: sec);
 }
 
+/// The time extent GeoMet advertises for [layer], or null.
+///
+/// A filtered GetCapabilities response still includes the parent group layers,
+/// each carrying its own time dimension, so the first `<Dimension name="time">`
+/// in the document is not necessarily this layer's. The search starts at the
+/// layer's own `<Name>` element.
+@visibleForTesting
+String? geoMetTimeExtentForLayer(String capabilitiesXml, String layer) {
+  final at = capabilitiesXml.indexOf('<Name>$layer</Name>');
+  if (at < 0) return null;
+  final match = RegExp(
+    r'<Dimension name="time"[^>]*>([^<]+)</Dimension>',
+  ).firstMatch(capabilitiesXml.substring(at));
+  return match?.group(1)?.trim();
+}
+
+/// Parses a GeoMet `start/end/period` extent. Null for anything malformed.
+@visibleForTesting
+({DateTime start, DateTime end, Duration step})? parseGeoMetExtent(
+  String? extent,
+) {
+  if (extent == null) return null;
+  final parts = extent.trim().split('/');
+  if (parts.length != 3) return null;
+  final start = DateTime.tryParse(parts[0])?.toUtc();
+  final end = DateTime.tryParse(parts[1])?.toUtc();
+  final step = parseIso8601Period(parts[2]);
+  if (start == null || end == null || step == null || step.inSeconds <= 0) {
+    return null;
+  }
+  if (end.isBefore(start)) return null;
+  return (start: start, end: end, step: step);
+}
+
+/// The forecast frames worth showing: the model's own steps from the current
+/// hour onward, capped at [horizon].
+///
+/// Frame instants always come from the advertised extent, never from the
+/// device clock, because GeoMet matches the `time` parameter exactly.
+@visibleForTesting
+List<DateTime> forecastFrameTimes({
+  required DateTime start,
+  required DateTime end,
+  required Duration step,
+  required DateTime now,
+  int horizon = _forecastHorizonHours,
+}) {
+  final utcNow = now.toUtc();
+  final currentHour = DateTime.utc(
+    utcNow.year,
+    utcNow.month,
+    utcNow.day,
+    utcNow.hour,
+  );
+  final frames = <DateTime>[];
+  for (
+    var t = start.toUtc();
+    !t.isAfter(end) && frames.length < horizon;
+    t = t.add(step)
+  ) {
+    if (t.isBefore(currentHour)) continue;
+    frames.add(t);
+  }
+  return frames;
+}
+
 class _RadarFrame {
   const _RadarFrame({
     required this.source,
     required this.unixTime,
     this.path,
     this.forecast = false,
+    this.geometLayer = _geometRadarLayer,
+    this.geometStyle = _geometRadarStyle,
+    this.modelled = false,
   });
 
   final _RadarSource source;
   final int unixTime;
+
+  /// GeoMet layer and style this frame is drawn from. Observed radar and the
+  /// model forecast are different WMS layers with different colour ramps.
+  final String geometLayer;
+  final String geometStyle;
+
+  /// True for ECCC model forecast frames (ADR 0008): computed by HRDPS, not
+  /// measured by a radar. Separate from [forecast], which marks RainViewer's
+  /// short nowcast tail, so the two are never confused.
+  final bool modelled;
 
   /// RainViewer tile path. Null for GeoMet frames, which address a frame by
   /// timestamp rather than by path.
@@ -105,18 +254,25 @@ class _RadarTimeline {
   const _RadarTimeline({
     required this.frames,
     this.source = _RadarSource.geomet,
+    this.modelled = false,
   });
 
   final List<_RadarFrame> frames;
   final _RadarSource source;
 
+  /// True for the HRDPS forecast loop.
+  final bool modelled;
+
   _RadarFrame? get latestOrNull => frames.isEmpty ? null : frames.last;
 
   bool get isEmpty => frames.isEmpty;
 
-  String get attribution => source == _RadarSource.geomet
-      ? _radarAttribution
-      : _radarAttributionFallback;
+  String get attribution {
+    if (modelled) return _forecastAttribution;
+    return source == _RadarSource.geomet
+        ? _radarAttribution
+        : _radarAttributionFallback;
+  }
 }
 
 /// Builds the tile layer for one radar frame.
@@ -129,8 +285,8 @@ Widget _radarTileLayer(_RadarFrame frame, {TileDisplay? tileDisplay}) {
     return TileLayer(
       wmsOptions: WMSTileLayerOptions(
         baseUrl: _geometBaseUrl,
-        layers: const [_geometRadarLayer],
-        styles: const [_geometRadarStyle],
+        layers: [frame.geometLayer],
+        styles: [frame.geometStyle],
         version: '1.3.0',
         format: 'image/png',
         transparent: true,
@@ -449,38 +605,27 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
       throw Exception('GeoMet unavailable (${response.statusCode})');
     }
 
-    final match = RegExp(
-      r'<Dimension name="time"[^>]*>([^<]+)</Dimension>',
-    ).firstMatch(response.body);
-    if (match == null) {
-      throw Exception('GeoMet returned no time dimension');
-    }
-
-    final parts = match.group(1)!.trim().split('/');
-    if (parts.length != 3) {
-      throw Exception('Unexpected GeoMet time extent');
-    }
-
-    final start = DateTime.tryParse(parts[0])?.toUtc();
-    final end = DateTime.tryParse(parts[1])?.toUtc();
-    final step = parseIso8601Period(parts[2]);
-    if (start == null || end == null || step == null || step.inSeconds <= 0) {
+    final extent = parseGeoMetExtent(
+      geoMetTimeExtentForLayer(response.body, _geometRadarLayer),
+    );
+    if (extent == null) {
       throw Exception('Unparseable GeoMet time extent');
     }
 
-    final frames = <_RadarFrame>[];
-    for (
-      var t = start;
-      !t.isAfter(end) && frames.length < _maxRadarFrames;
-      t = t.add(step)
-    ) {
-      frames.add(
+    final all = <_RadarFrame>[];
+    for (var t = extent.start; !t.isAfter(extent.end); t = t.add(extent.step)) {
+      all.add(
         _RadarFrame(
           source: _RadarSource.geomet,
           unixTime: t.millisecondsSinceEpoch ~/ 1000,
         ),
       );
     }
+    // If the window ever outgrows the cap, keep the newest frames: the oldest
+    // radar is the least useful.
+    final frames = all.length > _maxRadarFrames
+        ? all.sublist(all.length - _maxRadarFrames)
+        : all;
 
     if (frames.isEmpty) {
       throw Exception('No GeoMet radar frames available');
@@ -1871,17 +2016,14 @@ class _RadarPreviewCard extends StatelessWidget {
                 ),
               ),
               children: [
-                TileLayer(
-                  urlTemplate:
-                      'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
-                  userAgentPackageName: 'ca.alberta.weather',
-                ),
+                _basemapLayer(),
                 // Static newest frame; no cross-dissolve needed in the
                 // preview, so it paints instantly rather than fading in.
                 _radarTileLayer(
                   snapshot.data!.latestOrNull!,
                   tileDisplay: const TileDisplay.instantaneous(),
                 ),
+                _basemapLabelsLayer(),
               ],
             );
           },
@@ -2018,6 +2160,57 @@ class _AlbertaBorderPainter extends CustomPainter {
   bool shouldRepaint(_AlbertaBorderPainter old) => false;
 }
 
+/// The model forecast loop from ECCC HRDPS (ADR 0008).
+///
+/// There is no fallback: RainViewer no longer publishes a nowcast, and nothing
+/// else free covers Alberta hours ahead. When GeoMet is unreachable the sheet
+/// says so rather than showing something else.
+Future<_RadarTimeline> _fetchGeoMetForecastTimeline() async {
+  final response = await http
+      .get(
+        Uri.parse(
+          '${_geometBaseUrl}service=WMS&version=1.3.0'
+          '&request=GetCapabilities&LAYERS=$_geometForecastLayer',
+        ),
+      )
+      .timeout(const Duration(seconds: 12));
+  if (response.statusCode != 200) {
+    throw Exception('GeoMet forecast unavailable (${response.statusCode})');
+  }
+
+  final extent = parseGeoMetExtent(
+    geoMetTimeExtentForLayer(response.body, _geometForecastLayer),
+  );
+  if (extent == null) {
+    throw Exception('Unparseable GeoMet forecast extent');
+  }
+
+  final times = forecastFrameTimes(
+    start: extent.start,
+    end: extent.end,
+    step: extent.step,
+    now: DateTime.now(),
+  );
+  if (times.isEmpty) {
+    throw Exception('No forecast frames ahead of now');
+  }
+
+  return _RadarTimeline(
+    source: _RadarSource.geomet,
+    modelled: true,
+    frames: [
+      for (final t in times)
+        _RadarFrame(
+          source: _RadarSource.geomet,
+          unixTime: t.millisecondsSinceEpoch ~/ 1000,
+          geometLayer: _geometForecastLayer,
+          geometStyle: _geometForecastStyle,
+          modelled: true,
+        ),
+    ],
+  );
+}
+
 class _RadarViewerSheet extends StatefulWidget {
   const _RadarViewerSheet({
     required this.timelineFuture,
@@ -2031,21 +2224,38 @@ class _RadarViewerSheet extends StatefulWidget {
   State<_RadarViewerSheet> createState() => _RadarViewerSheetState();
 }
 
+enum _RadarMode { observed, forecast }
+
 class _RadarViewerSheetState extends State<_RadarViewerSheet> {
   Timer? _timer;
   int _frameIndex = 0;
   bool _playing = false;
+  _RadarMode _mode = _RadarMode.observed;
 
-  /// The resolved timeline.
+  /// The resolved observed timeline.
   ///
-  /// This is held in state rather than read out of a FutureBuilder snapshot
-  /// inside build(). The previous version wrote the frame count from build()
-  /// and read it from the playback timer, so a rebuild landing between two
-  /// ticks could advance the index against a stale count.
-  _RadarTimeline? _timeline;
+  /// Held in state rather than read out of a FutureBuilder snapshot inside
+  /// build(). An earlier version wrote the frame count from build() and read it
+  /// from the playback timer, so a rebuild landing between two ticks could
+  /// advance the index against a stale count.
+  _RadarTimeline? _observed;
   bool _resolving = true;
 
-  List<_RadarFrame> get _frames => _timeline?.frames ?? const [];
+  /// The model forecast (ADR 0008), fetched the first time forecast mode opens
+  /// and again once stale. HRDPS publishes a new run four times a day, and the
+  /// frames of a superseded run stop existing server-side, which flutter_map
+  /// would draw as blank tiles with no error.
+  _RadarTimeline? _forecast;
+  DateTime? _forecastFetchedAt;
+  bool _forecastLoading = false;
+  bool _forecastFailed = false;
+
+  static const _forecastMaxAge = Duration(minutes: 10);
+
+  _RadarTimeline? get _active =>
+      _mode == _RadarMode.forecast ? _forecast : _observed;
+
+  List<_RadarFrame> get _frames => _active?.frames ?? const [];
 
   @override
   void initState() {
@@ -2054,19 +2264,23 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
         .then((timeline) {
           if (!mounted) return;
           setState(() {
-            _timeline = timeline;
+            _observed = timeline;
             _resolving = false;
-            _frameIndex = timeline.frames.isEmpty
-                ? 0
-                : timeline.frames.length - 1;
+            if (_mode == _RadarMode.observed) {
+              _frameIndex = timeline.frames.isEmpty
+                  ? 0
+                  : timeline.frames.length - 1;
+            }
           });
           // Auto-play the loop as soon as the frames are ready.
-          if (timeline.frames.length > 1) _startPlaying();
+          if (_mode == _RadarMode.observed && timeline.frames.length > 1) {
+            _startPlaying();
+          }
         })
         .catchError((Object _) {
           if (!mounted) return;
           setState(() {
-            _timeline = const _RadarTimeline(frames: []);
+            _observed = const _RadarTimeline(frames: []);
             _resolving = false;
           });
         });
@@ -2103,180 +2317,280 @@ class _RadarViewerSheetState extends State<_RadarViewerSheet> {
     }
   }
 
+  void _setMode(_RadarMode mode) {
+    if (mode == _mode) return;
+    _timer?.cancel();
+    final observedCount = _observed?.frames.length ?? 0;
+    setState(() {
+      _mode = mode;
+      _playing = false;
+      // Observed opens on the newest frame, forecast on the first hour ahead.
+      _frameIndex = mode == _RadarMode.observed && observedCount > 0
+          ? observedCount - 1
+          : 0;
+    });
+
+    if (mode == _RadarMode.forecast) {
+      final fetchedAt = _forecastFetchedAt;
+      final fresh =
+          _forecast != null &&
+          fetchedAt != null &&
+          DateTime.now().difference(fetchedAt) < _forecastMaxAge;
+      if (!fresh) {
+        _loadForecast();
+        return;
+      }
+    }
+    _startPlaying();
+  }
+
+  Future<void> _loadForecast() async {
+    setState(() {
+      _forecastLoading = true;
+      _forecastFailed = false;
+    });
+    try {
+      final timeline = await _fetchGeoMetForecastTimeline();
+      if (!mounted) return;
+      setState(() {
+        _forecast = timeline;
+        _forecastFetchedAt = DateTime.now();
+        _forecastLoading = false;
+        if (_mode == _RadarMode.forecast) _frameIndex = 0;
+      });
+      if (_mode == _RadarMode.forecast) _startPlaying();
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _forecastLoading = false;
+        _forecastFailed = true;
+      });
+    }
+  }
+
+  String _frameLabel(_RadarFrame frame) {
+    final dt = frame.utc.toLocal();
+    String two(int v) => v.toString().padLeft(2, '0');
+    final clock = '${two(dt.hour)}:${two(dt.minute)}';
+    if (!frame.modelled) return clock;
+    // Hour 20 of a forecast loop is not self-evidently tomorrow, so model
+    // frames always carry the day.
+    const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    return '${days[dt.weekday - 1]} $clock';
+  }
+
+  String get _emptyMessage {
+    if (_mode == _RadarMode.forecast) {
+      return _forecastFailed
+          ? 'Forecast radar is unavailable right now.'
+          : 'No forecast frames available.';
+    }
+    return 'Radar temporarily unavailable.';
+  }
+
+  Widget _modeToggle() {
+    return SegmentedButton<_RadarMode>(
+      segments: [
+        const ButtonSegment(
+          value: _RadarMode.observed,
+          label: Text('Observed'),
+          icon: Icon(Icons.history),
+        ),
+        ButtonSegment(
+          value: _RadarMode.forecast,
+          label: Text('Next $_forecastHorizonHours h'),
+          icon: const Icon(Icons.update),
+        ),
+      ],
+      selected: {_mode},
+      showSelectedIcon: false,
+      onSelectionChanged: (selection) => _setMode(selection.first),
+      style: ButtonStyle(
+        visualDensity: VisualDensity.compact,
+        foregroundColor: WidgetStateProperty.resolveWith(
+          (states) => states.contains(WidgetState.selected)
+              ? _albertaBlue
+              : Colors.white,
+        ),
+        backgroundColor: WidgetStateProperty.resolveWith(
+          (states) => states.contains(WidgetState.selected)
+              ? _albertaGold
+              : Colors.transparent,
+        ),
+        side: WidgetStatePropertyAll(
+          BorderSide(color: Colors.white.withValues(alpha: 0.35)),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final loading = _mode == _RadarMode.forecast
+        ? _forecastLoading
+        : _resolving;
+    final frames = _frames;
+    if (frames.isNotEmpty && _frameIndex >= frames.length) {
+      _frameIndex = frames.length - 1;
+    }
+    final frame = (loading || frames.isEmpty) ? null : frames[_frameIndex];
+    final modelled = frame != null && (frame.forecast || frame.modelled);
+
     return Container(
       decoration: const BoxDecoration(
         color: Color(0xFF071F45),
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
-      child: Builder(
-        builder: (context) {
-          if (_resolving) {
-            return const Center(child: CircularProgressIndicator());
-          }
-
-          final frames = _frames;
-          if (frames.isEmpty) {
-            return const Center(
-              child: Text(
-                'Radar temporarily unavailable.',
-                style: TextStyle(color: Colors.white70),
-              ),
-            );
-          }
-          if (_frameIndex >= frames.length) {
-            _frameIndex = frames.length - 1;
-          }
-          final frame = frames[_frameIndex];
-          final dt = frame.utc.toLocal();
-
-          return Column(
-            children: [
-              const SizedBox(height: 8),
-              Container(
-                width: 40,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: Colors.white30,
-                  borderRadius: BorderRadius.circular(2),
+      child: Column(
+        children: [
+          const SizedBox(height: 8),
+          Container(
+            width: 40,
+            height: 4,
+            decoration: BoxDecoration(
+              color: Colors.white30,
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+            child: Row(
+              children: [
+                const Icon(Icons.radar, color: Colors.white),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Radar • ${widget.location.name}, ${widget.location.province}',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w700,
+                      fontSize: 16,
+                    ),
+                  ),
                 ),
-              ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
-                child: Row(
-                  children: [
-                    const Icon(Icons.radar, color: Colors.white),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        'Radar • ${widget.location.name}, ${widget.location.province}',
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.w700,
-                          fontSize: 16,
-                        ),
+                if (modelled) ...[
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 3,
+                    ),
+                    decoration: BoxDecoration(
+                      color: _albertaGold,
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                    child: const Text(
+                      'FORECAST',
+                      style: TextStyle(
+                        color: _albertaBlue,
+                        fontWeight: FontWeight.w800,
+                        fontSize: 11,
+                        letterSpacing: 0.5,
                       ),
                     ),
-                    if (frame.forecast) ...[
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 8,
-                          vertical: 3,
-                        ),
-                        decoration: BoxDecoration(
-                          color: _albertaGold,
-                          borderRadius: BorderRadius.circular(999),
-                        ),
-                        child: const Text(
-                          'FORECAST',
-                          style: TextStyle(
-                            color: _albertaBlue,
-                            fontWeight: FontWeight.w800,
-                            fontSize: 11,
-                            letterSpacing: 0.5,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                    ],
-                    Text(
-                      '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}',
+                  ),
+                  const SizedBox(width: 8),
+                ],
+                if (frame != null)
+                  Text(
+                    _frameLabel(frame),
+                    style: const TextStyle(color: Colors.white70),
+                  ),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: _modeToggle(),
+            ),
+          ),
+          Expanded(
+            child: loading
+                ? const Center(child: CircularProgressIndicator())
+                : frame == null
+                ? Center(
+                    child: Text(
+                      _emptyMessage,
                       style: const TextStyle(color: Colors.white70),
                     ),
-                  ],
-                ),
-              ),
-              Expanded(
-                child: FlutterMap(
-                  options: MapOptions(
-                    initialCenter: LatLng(
-                      widget.location.latitude,
-                      widget.location.longitude,
-                    ),
-                    initialZoom: 8,
-                    minZoom: 4,
-                    maxZoom: 11,
-                  ),
-                  children: [
-                    // Base map without labels, so town names and highways can
-                    // sit on top of the radar instead of being hidden under it.
-                    TileLayer(
-                      urlTemplate:
-                          'https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}.png',
-                      subdomains: const ['a', 'b', 'c'],
-                      maxNativeZoom: 19,
-                      userAgentPackageName: 'ca.alberta.weather',
-                    ),
-                    // Cross-dissolve each frame into the next so the loop reads
-                    // smoothly instead of hard-cutting between steps.
-                    _radarTileLayer(
-                      frame,
-                      tileDisplay: const TileDisplay.fadeIn(
-                        duration: Duration(milliseconds: 500),
+                  )
+                : FlutterMap(
+                    options: MapOptions(
+                      initialCenter: LatLng(
+                        widget.location.latitude,
+                        widget.location.longitude,
                       ),
+                      initialZoom: 8,
+                      minZoom: 4,
+                      maxZoom: 11,
                     ),
-                    // Labels (town names, highways) painted above the radar.
-                    TileLayer(
-                      urlTemplate:
-                          'https://{s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}.png',
-                      subdomains: const ['a', 'b', 'c'],
-                      maxNativeZoom: 19,
-                      userAgentPackageName: 'ca.alberta.weather',
-                    ),
-                  ],
+                    children: [
+                      // Base map without labels, so town names and highways
+                      // can sit on top of the radar instead of under it.
+                      _basemapLayer(),
+                      // Cross-dissolve each frame into the next so the loop
+                      // reads smoothly instead of hard-cutting between steps.
+                      _radarTileLayer(
+                        frame,
+                        tileDisplay: const TileDisplay.fadeIn(
+                          duration: Duration(milliseconds: 500),
+                        ),
+                      ),
+                      // Labels (town names, highways) painted above the radar.
+                      _basemapLabelsLayer(),
+                    ],
+                  ),
+          ),
+          if (frame != null) ...[
+            // ECCC requires attribution on GeoMet data. It sits on the radar
+            // surface itself, not in the portfolio footer, which is a
+            // separate commercial element under Ad-Free.
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  '${_active?.attribution ?? _radarAttribution}. '
+                  '$_basemapAttribution',
+                  style: const TextStyle(color: Colors.white38, fontSize: 11),
                 ),
               ),
-              // ECCC requires attribution on GeoMet data. It sits on the radar
-              // surface itself, not in the portfolio footer, which is a
-              // separate commercial element under Ad-Free.
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
-                child: Align(
-                  alignment: Alignment.centerLeft,
-                  child: Text(
-                    _timeline?.attribution ?? _radarAttribution,
-                    style: const TextStyle(
-                      color: Colors.white38,
-                      fontSize: 11,
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 4, 10, 16),
+              child: Row(
+                children: [
+                  IconButton(
+                    onPressed: _togglePlay,
+                    icon: Icon(
+                      _playing ? Icons.pause_circle : Icons.play_circle,
+                      color: Colors.white,
+                      size: 34,
                     ),
                   ),
-                ),
-              ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(10, 4, 10, 16),
-                child: Row(
-                  children: [
-                    IconButton(
-                      onPressed: _togglePlay,
-                      icon: Icon(
-                        _playing ? Icons.pause_circle : Icons.play_circle,
-                        color: Colors.white,
-                        size: 34,
-                      ),
+                  Expanded(
+                    child: Slider(
+                      value: _frameIndex.toDouble(),
+                      min: 0,
+                      max: (frames.length - 1).toDouble(),
+                      divisions: frames.length > 1 ? frames.length - 1 : 1,
+                      activeColor: _albertaGold,
+                      onChanged: (value) {
+                        _timer?.cancel();
+                        setState(() {
+                          _playing = false;
+                          _frameIndex = value.round();
+                        });
+                      },
                     ),
-                    Expanded(
-                      child: Slider(
-                        value: _frameIndex.toDouble(),
-                        min: 0,
-                        max: (frames.length - 1).toDouble(),
-                        divisions: frames.length > 1 ? frames.length - 1 : 1,
-                        activeColor: _albertaGold,
-                        onChanged: (value) {
-                          _timer?.cancel();
-                          setState(() {
-                            _playing = false;
-                            _frameIndex = value.round();
-                          });
-                        },
-                      ),
-                    ),
-                  ],
-                ),
+                  ),
+                ],
               ),
-            ],
-          );
-        },
+            ),
+          ] else
+            const SizedBox(height: 24),
+        ],
       ),
     );
   }

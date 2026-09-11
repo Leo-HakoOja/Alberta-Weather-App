@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from collections import Counter
 import json
 import time
 from contextlib import suppress
@@ -383,6 +384,107 @@ def _build_dayparts(
     ]
 
 
+# Condition groups for the daily headline, ranked by how much they matter to
+# someone planning a day: thunder above snow above rain, and so on.
+_CONDITION_SEVERITY = {
+    "clear": 0,
+    "partly": 1,
+    "overcast": 2,
+    "fog": 2,
+    "drizzle": 3,
+    "rain": 4,
+    "snow": 5,
+    "thunder": 6,
+}
+_PRECIP_GROUPS = frozenset({"drizzle", "rain", "snow", "thunder"})
+
+# Daylight hours a precipitation type must cover before it becomes the day's
+# headline. Below this it is a passing shower, and the card's rain-chance figure
+# already says so.
+PRECIP_HEADLINE_MIN_HOURS = 3
+
+
+def _condition_group(code: object) -> str | None:
+    if isinstance(code, bool) or not isinstance(code, int):
+        return None
+    if code in (0, 1):
+        return "clear"
+    if code == 2:
+        return "partly"
+    if code == 3:
+        return "overcast"
+    if code in (45, 48):
+        return "fog"
+    if 51 <= code <= 57:
+        return "drizzle"
+    if 61 <= code <= 67 or 80 <= code <= 82:
+        return "rain"
+    if 71 <= code <= 77 or code in (85, 86):
+        return "snow"
+    if code >= 95:
+        return "thunder"
+    return None
+
+
+def _representative_daily_code(daylight_codes: list[object], fallback: object) -> object:
+    """The condition a person would say the day *was*, not its worst hour.
+
+    Open-Meteo documents its daily `weather_code` as "the most severe weather
+    condition on a given day", taken across all 24 hours. One overcast hour at
+    3 a.m. turns a day of twelve clear daylight hours into an Overcast card, which
+    the day's own tap-through (the most common condition in each part of the day)
+    then contradicts.
+
+    This looks at daylight hours only and takes the most common condition group,
+    ties going to the more severe group. Precipitation takes the headline once it
+    covers PRECIP_HEADLINE_MIN_HOURS, so a genuinely wet day still reads as wet.
+    With no hourly data for the day it falls back to Open-Meteo's own code.
+    """
+    codes = [c for c in daylight_codes if _condition_group(c) is not None]
+    if not codes:
+        return fallback
+
+    wet = [c for c in codes if _condition_group(c) in _PRECIP_GROUPS]
+    if len(wet) >= PRECIP_HEADLINE_MIN_HOURS:
+        candidates = wet
+    else:
+        candidates = [
+            c for c in codes if _condition_group(c) not in _PRECIP_GROUPS
+        ] or codes
+
+    groups = Counter(_condition_group(c) for c in candidates)
+    winner = max(groups, key=lambda g: (groups[g], _CONDITION_SEVERITY.get(g, 0)))
+    in_group = Counter(c for c in candidates if _condition_group(c) == winner)
+    # Within the winning group: the most common code, ties to the more intense.
+    return max(in_group, key=lambda c: (in_group[c], c))
+
+
+def _daylight_codes_by_date(
+    hourly: dict,
+    sunrise_by_date: dict[str, object],
+    sunset_by_date: dict[str, object],
+) -> dict[str, list[object]]:
+    times = hourly.get("time", [])
+    codes = hourly.get("weather_code", [])
+    by_date: dict[str, list[object]] = {}
+    for idx, iso in enumerate(times):
+        if not isinstance(iso, str) or "T" not in iso or idx >= len(codes):
+            continue
+        date = iso.split("T", 1)[0]
+        daylight = _is_daylight_at(
+            iso, sunrise_by_date.get(date), sunset_by_date.get(date)
+        )
+        if daylight is None:
+            # No sunrise or sunset for this date: treat 06:00 to 18:00 as day.
+            hour = None
+            with suppress(TypeError, ValueError):
+                hour = int(iso.split("T", 1)[1][:2])
+            daylight = hour is not None and 6 <= hour < 18
+        if daylight:
+            by_date.setdefault(date, []).append(codes[idx])
+    return by_date
+
+
 def normalize_forecast_response(data: dict, location: dict) -> dict:
     current = data.get("current", {})
     current_units = data.get("current_units", {})
@@ -455,15 +557,23 @@ def normalize_forecast_response(data: dict, location: dict) -> dict:
         sunset_by_date=sunset_by_date,
     )
 
+    daylight_codes = _daylight_codes_by_date(hourly, sunrise_by_date, sunset_by_date)
     daily_items = []
     for i, date_str in enumerate(dates):
-        code = daily.get("weather_code", [None] * len(dates))[i]
+        most_severe = daily.get("weather_code", [None] * len(dates))[i]
+        code = _representative_daily_code(
+            daylight_codes.get(date_str, []), most_severe
+        )
         daily_items.append(
             {
                 "date": date_str,
                 "label": format_iso_label(date_str, "%a %b %d"),
                 "weather_code": code,
                 "weather": weather_description(code),
+                # Open-Meteo's own daily code, the worst hour of the day. Kept so a
+                # client can still flag a possible shower without it becoming the
+                # headline.
+                "weather_code_most_severe": most_severe,
                 "temperature_min": daily.get("temperature_2m_min", [None] * len(dates))[
                     i
                 ],

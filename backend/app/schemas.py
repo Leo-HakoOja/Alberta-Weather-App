@@ -52,8 +52,11 @@ class HourlyForecastItem(BaseModel):
 class DailyForecastItem(BaseModel):
     date: str
     label: str
+    # The day's representative condition (daylight hours, most common).
     weather_code: int | None
     weather: str
+    # The single most severe hour, as Open-Meteo reports it. Not the headline.
+    weather_code_most_severe: int | None = None
     temperature_min: float | None
     temperature_max: float | None
     uv_index_max: float | None
