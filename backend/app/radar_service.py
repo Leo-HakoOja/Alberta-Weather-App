@@ -517,6 +517,14 @@ _UPSTREAM = threading.BoundedSemaphore(4)
 """At most four requests to GeoMet at once from this machine. It renders on
 demand, so this is ECCC's CPU as much as ours."""
 
+_BUILD = threading.BoundedSemaphore(4)
+"""At most four grids decoded at once. Each build peaks around 27 MB of float64
+intermediates over the 888,420 cells of the grid, and a cold phone asks for
+about 37 frames and 23 flows at once, so unbounded decoding walks a small
+machine into the OOM killer. Hold this only around leaf work: the frame builds
+inside a flow finish before that flow takes it for estimate_flow, so it is
+never held by a caller waiting to take it again."""
+
 _CAPS_TTL_SECONDS = 60
 _WARNINGS_TTL_SECONDS = 60
 _MAX_FRAMES = 160
@@ -591,9 +599,13 @@ def observed_frame(instant: datetime) -> bytes:
     if instant not in times:
         raise LookupError(f"No observed radar at {iso(instant)}")
     key = f"obs/{stamp(instant)}"
-    return _single_flight(
-        key, _frames, lambda: pack(decode_radar_png(_http_get(radar_url(instant))))
-    )
+
+    def produce() -> bytes:
+        data = _http_get(radar_url(instant))
+        with _BUILD:
+            return pack(decode_radar_png(data))
+
+    return _single_flight(key, _frames, produce)
 
 
 def _check_run(run: datetime) -> None:
@@ -608,9 +620,13 @@ def forecast_frame(run: datetime, instant: datetime) -> bytes:
     if not (timedelta(hours=1) <= lead <= timedelta(hours=48)) or instant.minute or instant.second:
         raise LookupError(f"No forecast hour {iso(instant)} in run {iso(run)}")
     key = f"fc/{stamp(run)}/{stamp(instant)}"
-    return _single_flight(
-        key, _frames, lambda: pack(decode_forecast_tiff(_http_get(forecast_url(run, instant))))
-    )
+
+    def produce() -> bytes:
+        data = _http_get(forecast_url(run, instant))
+        with _BUILD:
+            return pack(decode_forecast_tiff(data))
+
+    return _single_flight(key, _frames, produce)
 
 
 def forecast_flow(run: datetime, instant: datetime) -> dict:
@@ -621,7 +637,8 @@ def forecast_flow(run: datetime, instant: datetime) -> dict:
     def produce() -> dict:
         a = unpack(forecast_frame(run, instant))
         b = unpack(forecast_frame(run, nxt))
-        dx, dy = estimate_flow(a, b)
+        with _BUILD:
+            dx, dy = estimate_flow(a, b)
         return {
             "run": iso(run),
             "from": iso(instant),
